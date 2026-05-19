@@ -27,3 +27,26 @@ jobs:
         run: go test ./...
       - name: Race
         run: go test -race ./...
+
+  redis-integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+      - name: Integration tests against real Redis
+        env:
+          REDIS_ADDR: localhost:6379
+        run: go test -tags=integration -race ./pkg/store/redis/...

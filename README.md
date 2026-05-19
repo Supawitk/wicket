@@ -126,6 +126,37 @@ The sidecar watches the YAML file. Changes to `rate_limit` and
 `circuit_breaker` are applied without dropping in-flight requests; the
 other sections require a restart.
 
+### Deployment notes
+
+- **Behind a load balancer / CDN.** The default rate-limit key is
+  `RemoteAddr`. Behind a proxy that becomes the proxy's IP and every
+  client collapses into one bucket. Use [`wicket.ProxyAwareKey`](wicket.go)
+  to read `X-Forwarded-For` with a trusted-hop count:
+
+  ```go
+  wicket.WithKeyFunc(wicket.ProxyAwareKey(1)) // one trusted proxy in front
+  ```
+
+  Never set the hop count higher than the number of proxies you actually
+  control — attackers can forge XFF entries below your trust boundary.
+
+- **Mobile / carrier-NAT traffic.** Millions of users can share a handful
+  of public IPs. Pure IP rate-limiting will fire on legitimate users.
+  Prefer an identity-derived key (e.g. the passkey credential ID after
+  sign-in) for those flows.
+
+- **Real-Redis integration tests.** The shipped Redis test suite uses
+  `miniredis` (a faithful in-process reimpl of the RESP protocol). To
+  exercise the store against an actual `redis-server` or compatible
+  engine (Dragonfly / Valkey / KeyDB), run:
+
+  ```bash
+  REDIS_ADDR=localhost:6379 go test -tags=integration -race ./pkg/store/redis/...
+  ```
+
+  CI runs this against a `redis:7-alpine` service container on every
+  push.
+
 Runnable demos:
 
 - [examples/01-minimal](examples/01-minimal) — wrap a handler, expose admin endpoints.

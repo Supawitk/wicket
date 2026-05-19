@@ -1,6 +1,9 @@
 package ratelimit
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -76,5 +79,71 @@ func TestSize(t *testing.T) {
 	l.Allow("c")
 	if got := l.Size(); got != 3 {
 		t.Fatalf("Size = %d want 3", got)
+	}
+}
+
+// TestConcurrentAllowSameKey hammers Allow on one key from many goroutines.
+// With -race this catches any unsynchronised access to the shared bucket.
+// The total allowed must equal the burst exactly: no double-grants, no
+// lost tokens. The clock is frozen to remove refill from the equation.
+func TestConcurrentAllowSameKey(t *testing.T) {
+	const goroutines = 1000
+	const burst = 100
+
+	now := time.Unix(0, 0)
+	l := New(Config{Rate: 1, Burst: burst, Now: func() time.Time { return now }})
+
+	var allowed int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			if l.Allow("k") {
+				atomic.AddInt64(&allowed, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if allowed != burst {
+		t.Fatalf("allowed=%d, want exactly %d (burst)", allowed, burst)
+	}
+}
+
+// TestConcurrentAllowDistinctKeys exercises the per-key map under heavy
+// parallel creation. Each goroutine uses its own key, so every Allow must
+// succeed; the failure mode would be a map race or a lost bucket insert.
+func TestConcurrentAllowDistinctKeys(t *testing.T) {
+	const goroutines = 1000
+
+	now := time.Unix(0, 0)
+	l := New(Config{Rate: 1, Burst: 1, Now: func() time.Time { return now }})
+
+	var allowed int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		key := fmt.Sprintf("k-%d", i)
+		go func() {
+			defer wg.Done()
+			<-start
+			if l.Allow(key) {
+				atomic.AddInt64(&allowed, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if allowed != goroutines {
+		t.Fatalf("allowed=%d, want %d", allowed, goroutines)
+	}
+	if got := l.Size(); got != goroutines {
+		t.Fatalf("Size=%d, want %d", got, goroutines)
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -297,6 +299,87 @@ func TestAdminMetricsForChallenges(t *testing.T) {
 	_ = res.Body.Close()
 	if got := testutil.ToFloat64(m.ChallengeVerified.WithLabelValues(metrics.ChallengeUnknown)); got != 1 {
 		t.Errorf("unknown verifies = %v want 1", got)
+	}
+}
+
+// TestWrapConcurrentRequests fires many concurrent requests through Wrap
+// with both a rate limiter and a breaker installed. Under -race this
+// surfaces any unsynchronised access to the limiter map, breaker state,
+// or the statusRecorder. The exact admit/deny split is asserted: with a
+// frozen-burst limiter we know precisely how many requests can pass.
+func TestWrapConcurrentRequests(t *testing.T) {
+	const goroutines = 1000
+	const burst = 50
+
+	now := time.Unix(0, 0)
+	lim := ratelimit.New(ratelimit.Config{Rate: 1, Burst: burst, Now: func() time.Time { return now }})
+
+	w := New(
+		WithLimiter(lim),
+		WithCircuitBreaker(circuit.New(circuit.DefaultConfig())),
+		WithKeyFunc(func(r *http.Request) string { return "shared" }),
+	)
+	srv := httptest.NewServer(w.Wrap(http.HandlerFunc(okHandler)))
+	defer srv.Close()
+
+	var admitted, throttled int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := http.Get(srv.URL)
+			if err != nil {
+				return
+			}
+			_ = res.Body.Close()
+			switch res.StatusCode {
+			case http.StatusOK:
+				atomic.AddInt64(&admitted, 1)
+			case http.StatusTooManyRequests:
+				atomic.AddInt64(&throttled, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if admitted != burst {
+		t.Fatalf("admitted=%d, want exactly %d (burst)", admitted, burst)
+	}
+	if admitted+throttled != goroutines {
+		t.Fatalf("admitted+throttled=%d, want %d", admitted+throttled, goroutines)
+	}
+}
+
+func TestProxyAwareKey(t *testing.T) {
+	cases := []struct {
+		name        string
+		hops        int
+		xff         string
+		remote      string
+		want        string
+	}{
+		{"single-hop", 1, "203.0.113.5, 10.0.0.1", "10.0.0.1:443", "10.0.0.1"},
+		{"two-hop", 2, "203.0.113.5, 10.0.0.1, 10.0.0.2", "10.0.0.2:443", "10.0.0.1"},
+		{"missing-xff falls back to remote", 1, "", "192.0.2.7:1234", "192.0.2.7"},
+		{"too-few-hops falls back", 5, "203.0.113.5, 10.0.0.1", "10.0.0.1:443", "10.0.0.1"},
+		{"single-entry", 1, "203.0.113.5", "10.0.0.1:443", "203.0.113.5"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fn := ProxyAwareKey(c.hops)
+			r, _ := http.NewRequest("GET", "http://x/", nil)
+			r.RemoteAddr = c.remote
+			if c.xff != "" {
+				r.Header.Set("X-Forwarded-For", c.xff)
+			}
+			if got := fn(r); got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
 	}
 }
 
