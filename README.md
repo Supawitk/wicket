@@ -4,7 +4,7 @@
 
 Verifiable-fair waiting room · Adaptive bot challenge · Circuit breaker · Rate limit · Pluggable identity.
 
-[Quick Start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Tech Stack](#tech-stack)
+[Quick Start](#quick-start) · [Features](#features) · [Architecture](#architecture)
 
 ---
 
@@ -205,25 +205,6 @@ Runnable demos:
 ```
 
 Each block is a pluggable interface. Disable, swap, or extend any of them.
-
----
-
-## Tech Stack
-
-Wicket is built on proven, boring infrastructure. Nothing experimental.
-
-| Layer | Shipped | Planned |
-|---|---|---|
-| Language | Go 1.26.3 | — |
-| HTTP | `net/http` (stdlib) | Gin / Fiber / Echo / Chi adapters |
-| Storage | in-memory, Redis (also Dragonfly/Valkey/KeyDB), `degrading` wrapper | Postgres |
-| Randomness | Ed25519 per-ticket proofs (default) + SHA-256 commit-reveal mode | drand-coordinated multi-instance VRF |
-| Audit log | Merkle log with inclusion proofs | append-only signed log |
-| Circuit breaker | in-house (Closed → Open → Half-Open) | — |
-| Rate limit | per-key token bucket | sliding window option |
-| Config | YAML with hot reload via `fsnotify` | env-var overrides |
-| Observability | Prometheus metrics on by default | OpenTelemetry traces |
-| Identity *(optional)* | passkey (Ed25519 credential) | Self Protocol, NDID, Human Passport |
 
 ---
 
