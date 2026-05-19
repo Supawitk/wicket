@@ -1,22 +1,10 @@
-<div align="center">
-
-<img src="docs/assets/logo.svg" alt="Wicket logo" width="160" />
-
 # Wicket
 
 **Admission control backbone for Go.**
 
 Verifiable-fair waiting room · Adaptive bot challenge · Circuit breaker · Rate limit · Pluggable identity.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/Supawitk/wicket.svg)](https://pkg.go.dev/github.com/Supawitk/wicket)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Supawitk/wicket)](https://goreportcard.com/report/github.com/Supawitk/wicket)
-[![CI](https://github.com/Supawitk/wicket/actions/workflows/ci.yml/badge.svg)](https://github.com/Supawitk/wicket/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.26.3-00ADD8?logo=go)](go.mod)
-
-[Quick Start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Comparison](#comparison) · [Tech Stack](#tech-stack) · [Docs](docs/)
-
-</div>
+[Quick Start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Tech Stack](#tech-stack)
 
 ---
 
@@ -58,8 +46,6 @@ Wicket combines them in one self-hosted binary, adds a cryptographically verifia
 - 📈 **Prometheus metrics** — request outcomes, breaker state, queue size, challenge counters, store-degraded gauge, all on by default in the sidecar.
 - 🔄 **Hot-reloadable config** — the sidecar watches its YAML file; dynamic sections (rate limit, breaker) reload without dropping in-flight requests.
 - 📦 **Single binary sidecar** — `wicket -config wicket.yml` proxies any HTTP upstream.
-
-See the [Roadmap](#roadmap) for what's still in flight.
 
 ---
 
@@ -201,27 +187,6 @@ Each block is a pluggable interface. Disable, swap, or extend any of them.
 
 ---
 
-## Comparison
-
-| Feature | Wicket | Anubis | mCaptcha | Queue-it | Cloudflare WR |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Open source | ✅ | ✅ | ✅ | ❌ | partial |
-| Self-hosted | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Adaptive PoW | ✅ | ✅ | ✅ | ❌ | ✅ |
-| Virtual waiting room | ✅ | ❌ | ❌ | ✅ | ✅ |
-| **Verifiable-fair queue** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Per-ticket cryptographic proof** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Merkle audit log** | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Rate limit | ✅ | ❌ | partial | ❌ | ✅ |
-| Circuit breaker | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Pluggable identity (passkey) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Graceful store degradation | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Prometheus metrics built in | ✅ | partial | partial | ✅ | ✅ |
-| Hot-reloadable config | ✅ | ❌ | ❌ | ✅ | ✅ |
-| Single binary | ✅ | ✅ | ✅ | ❌ | ❌ |
-
----
-
 ## Tech Stack
 
 Wicket is built on proven, boring infrastructure. Nothing experimental.
@@ -248,43 +213,6 @@ Wicket is built on proven, boring infrastructure. Nothing experimental.
 - **Bank / fintech bursts** — payday transaction storms, government payouts
 - **High-volume signup flows** — viral launches, beta access
 - **API throttling** — protect backend from bursty downstream clients
-
----
-
-## Roadmap
-
-Shipped in v1.0.0:
-
-- [x] Core interfaces (`Challenger`, `Queue`, `Identity`, `Store`)
-- [x] Adaptive proof-of-work challenger (SHA-256 and Argon2id memory-bound)
-- [x] FIFO queue
-- [x] VRF queue — Ed25519 mode (default) with per-ticket proofs
-- [x] VRF queue — RFC 9381 ECVRF mode
-- [x] VRF queue — seed mode (commit-reveal)
-- [x] Pre-queue + `Open()` for lottery-then-FIFO admission
-- [x] Merkle audit log with `O(log N)` inclusion proofs
-- [x] Per-key token-bucket rate limiter
-- [x] Three-state circuit breaker
-- [x] HMAC-signed, single-use admission tokens
-- [x] In-memory store
-- [x] Redis store (works with Dragonfly, Valkey, KeyDB)
-- [x] Graceful-degradation store wrapper (primary + fallback)
-- [x] Prometheus metrics package, on by default in the sidecar
-- [x] OpenTelemetry traces via `otelhttp`, OTLP exporter wired into the sidecar
-- [x] Passkey identity adapter (Ed25519 credentials)
-- [x] Standalone `wicket` binary (reverse-proxy sidecar)
-- [x] Hot-reloadable YAML config via `fsnotify` (watches the parent directory to survive atomic-rename editors)
-- [x] JSON admin endpoints (challenge / solve / enqueue / status / metrics)
-- [x] Reproducible Go benchmarks in [bench/](bench/)
-- [x] Concert-drop + client-side verifier example apps
-
-Planned:
-
-- [ ] Postgres store
-- [ ] Identity adapters: Self Protocol, NDID, Human Passport
-- [ ] drand-coordinated multi-instance VRF
-- [ ] Framework adapters: Gin, Fiber, Echo, Chi
-- [ ] Side-by-side benchmarks vs Anubis, mCaptcha, Cloudflare Turnstile
 
 ---
 
