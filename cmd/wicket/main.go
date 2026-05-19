@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -60,6 +61,21 @@ import (
 type config struct {
 	Listen   string `yaml:"listen"`
 	Upstream string `yaml:"upstream"`
+
+	// Timeouts protect the sidecar listener and the upstream Transport
+	// against slowloris and stalled upstreams. Zero falls back to safe
+	// defaults; set to a negative duration to disable an individual
+	// timeout.
+	Timeouts struct {
+		ReadHeader        time.Duration `yaml:"read_header"`
+		Read              time.Duration `yaml:"read"`
+		Write             time.Duration `yaml:"write"`
+		Idle              time.Duration `yaml:"idle"`
+		UpstreamDial      time.Duration `yaml:"upstream_dial"`
+		UpstreamResponse  time.Duration `yaml:"upstream_response"`
+		UpstreamKeepalive time.Duration `yaml:"upstream_keepalive"`
+		UpstreamMaxConns  int           `yaml:"upstream_max_conns"`
+	} `yaml:"timeouts"`
 
 	PoW struct {
 		Enabled        bool   `yaml:"enabled"`
@@ -131,13 +147,16 @@ type staticParts struct {
 	tracer         trace.Tracer
 	tracerProvider *sdktrace.TracerProvider
 	store          store.Store
+	transport      *http.Transport
 
-	// limiter is preserved across hot reloads so an in-flight rate-limit
-	// attack cannot reset every token bucket by triggering a config
-	// reload on an unrelated field. It is rebuilt only when the
-	// rate_limit section itself changes.
+	// limiter and breaker are preserved across hot reloads so an
+	// in-flight attack cannot reset their state by triggering a config
+	// reload on an unrelated field. Each is rebuilt only when its own
+	// config section changes.
 	limiter   *ratelimit.TokenBucket
 	limiterMu sync.Mutex
+	breaker   *circuit.Breaker
+	breakerMu sync.Mutex
 }
 
 func main() {
@@ -187,7 +206,18 @@ func run(args []string) error {
 
 	go watchConfig(ctx, *configPath, static, apply)
 
-	srv := &http.Server{Addr: cfg.Listen, Handler: proxy}
+	srv := &http.Server{
+		Addr:    cfg.Listen,
+		Handler: proxy,
+		// Slowloris and resource-exhaustion guardrails. A naïve
+		// http.Server{} accepts a connection that dribbles one byte
+		// every 30 seconds forever, pinning file descriptors at zero
+		// CPU cost to the attacker.
+		ReadHeaderTimeout: timeoutOr(cfg.Timeouts.ReadHeader, 5*time.Second),
+		ReadTimeout:       timeoutOr(cfg.Timeouts.Read, 30*time.Second),
+		WriteTimeout:      timeoutOr(cfg.Timeouts.Write, 30*time.Second),
+		IdleTimeout:       timeoutOr(cfg.Timeouts.Idle, 120*time.Second),
+	}
 	if srv.Addr == "" {
 		srv.Addr = ":8080"
 	}
@@ -319,6 +349,7 @@ func buildStatic(cfg *config) (*staticParts, error) {
 		tracer:         tracer,
 		tracerProvider: tp,
 		store:          st,
+		transport:      upstreamTransport(cfg),
 	}, nil
 }
 
@@ -349,6 +380,41 @@ func buildStore(cfg *struct {
 	default:
 		return nil, fmt.Errorf("unknown store.backend %q", cfg.Backend)
 	}
+}
+
+// timeoutOr returns the configured timeout when set, the default when
+// the field is zero, or zero (no timeout) when the field is negative.
+func timeoutOr(configured, fallback time.Duration) time.Duration {
+	switch {
+	case configured > 0:
+		return configured
+	case configured < 0:
+		return 0
+	default:
+		return fallback
+	}
+}
+
+// upstreamTransport returns an *http.Transport tuned for a sidecar
+// proxying to a single upstream. The defaults from http.DefaultTransport
+// are fine for an outbound HTTP client; a sidecar in front of one
+// backend wants per-host caps and an actual response timeout so a
+// stalled backend cannot exhaust the sidecar's connection budget.
+func upstreamTransport(t *config) *http.Transport {
+	maxConns := t.Timeouts.UpstreamMaxConns
+	if maxConns <= 0 {
+		maxConns = 512
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxConnsPerHost = maxConns
+	tr.MaxIdleConnsPerHost = maxConns
+	tr.IdleConnTimeout = timeoutOr(t.Timeouts.UpstreamKeepalive, 90*time.Second)
+	tr.ResponseHeaderTimeout = timeoutOr(t.Timeouts.UpstreamResponse, 30*time.Second)
+	if dt := timeoutOr(t.Timeouts.UpstreamDial, 5*time.Second); dt > 0 {
+		dialer := &net.Dialer{Timeout: dt, KeepAlive: 30 * time.Second}
+		tr.DialContext = dialer.DialContext
+	}
+	return tr
 }
 
 func newTracerProvider(endpoint, service string, samplingRatio float64) (*sdktrace.TracerProvider, error) {
@@ -403,26 +469,13 @@ func buildHandler(cfg *config, static *staticParts) (http.Handler, error) {
 		clearLimiter(static)
 	}
 	if cfg.CircuitBreaker.FailureRatio > 0 || cfg.CircuitBreaker.MinSamples > 0 {
-		bcfg := circuit.DefaultConfig()
-		if cfg.CircuitBreaker.FailureRatio > 0 {
-			bcfg.FailureRatio = cfg.CircuitBreaker.FailureRatio
-		}
-		if cfg.CircuitBreaker.MinSamples > 0 {
-			bcfg.MinSamples = cfg.CircuitBreaker.MinSamples
-		}
-		if cfg.CircuitBreaker.Cooldown > 0 {
-			bcfg.Cooldown = cfg.CircuitBreaker.Cooldown
-		}
-		if cfg.CircuitBreaker.HalfOpenMax > 0 {
-			bcfg.HalfOpenMax = cfg.CircuitBreaker.HalfOpenMax
-		}
-		if cfg.CircuitBreaker.Window > 0 {
-			bcfg.Window = cfg.CircuitBreaker.Window
-		}
-		if cfg.CircuitBreaker.WindowBuckets > 0 {
-			bcfg.WindowBuckets = cfg.CircuitBreaker.WindowBuckets
-		}
-		opts = append(opts, wicket.WithCircuitBreaker(circuit.New(bcfg)))
+		// Reuse the existing breaker when the circuit_breaker section
+		// is unchanged. Without this, a hot reload during an outage
+		// would reset an Open breaker to Closed and immediately admit
+		// a fresh stampede to the failing backend.
+		opts = append(opts, wicket.WithCircuitBreaker(getOrBuildBreaker(static, cfg.CircuitBreaker)))
+	} else {
+		clearBreaker(static)
 	}
 	if static.chal != nil {
 		opts = append(opts, wicket.WithPoW(static.chal))
@@ -439,6 +492,7 @@ func buildHandler(cfg *config, static *staticParts) (http.Handler, error) {
 
 	w := wicket.New(opts...)
 	proxy := httputil.NewSingleHostReverseProxy(static.upstream)
+	proxy.Transport = static.transport
 
 	mux := http.NewServeMux()
 	mux.Handle("/__wicket__/", http.StripPrefix("/__wicket__", w.AdminHandler()))
@@ -561,6 +615,68 @@ func sameLimiterCfg(a, b struct {
 		a.SweepInterval == b.SweepInterval
 }
 
+// getOrBuildBreaker mirrors getOrBuildLimiter for the circuit breaker:
+// reuse the existing instance when the circuit_breaker section is
+// unchanged so a reload during an outage cannot reset an Open breaker
+// to Closed.
+func getOrBuildBreaker(static *staticParts, cb struct {
+	FailureRatio  float64       `yaml:"failure_ratio"`
+	MinSamples    int64         `yaml:"min_samples"`
+	Cooldown      time.Duration `yaml:"cooldown"`
+	HalfOpenMax   int64         `yaml:"half_open_max"`
+	Window        time.Duration `yaml:"window"`
+	WindowBuckets int           `yaml:"window_buckets"`
+}) *circuit.Breaker {
+	static.breakerMu.Lock()
+	defer static.breakerMu.Unlock()
+	if static.breaker == nil || !sameBreakerCfg(static.cfg.CircuitBreaker, cb) {
+		bcfg := circuit.DefaultConfig()
+		if cb.FailureRatio > 0 {
+			bcfg.FailureRatio = cb.FailureRatio
+		}
+		if cb.MinSamples > 0 {
+			bcfg.MinSamples = cb.MinSamples
+		}
+		if cb.Cooldown > 0 {
+			bcfg.Cooldown = cb.Cooldown
+		}
+		if cb.HalfOpenMax > 0 {
+			bcfg.HalfOpenMax = cb.HalfOpenMax
+		}
+		if cb.Window > 0 {
+			bcfg.Window = cb.Window
+		}
+		if cb.WindowBuckets > 0 {
+			bcfg.WindowBuckets = cb.WindowBuckets
+		}
+		static.breaker = circuit.New(bcfg)
+	}
+	static.cfg.CircuitBreaker = cb
+	return static.breaker
+}
+
+func clearBreaker(static *staticParts) {
+	static.breakerMu.Lock()
+	defer static.breakerMu.Unlock()
+	static.breaker = nil
+}
+
+func sameBreakerCfg(a, b struct {
+	FailureRatio  float64       `yaml:"failure_ratio"`
+	MinSamples    int64         `yaml:"min_samples"`
+	Cooldown      time.Duration `yaml:"cooldown"`
+	HalfOpenMax   int64         `yaml:"half_open_max"`
+	Window        time.Duration `yaml:"window"`
+	WindowBuckets int           `yaml:"window_buckets"`
+}) bool {
+	return a.FailureRatio == b.FailureRatio &&
+		a.MinSamples == b.MinSamples &&
+		a.Cooldown == b.Cooldown &&
+		a.HalfOpenMax == b.HalfOpenMax &&
+		a.Window == b.Window &&
+		a.WindowBuckets == b.WindowBuckets
+}
+
 // changedStatic reports whether any field that requires a restart
 // differs between old and new configs.
 func changedStatic(a, b *config) bool {
@@ -589,6 +705,9 @@ func staticDiff(a, b *config) string {
 	}
 	if a.Tracing != b.Tracing {
 		diffs = append(diffs, "tracing")
+	}
+	if a.Timeouts != b.Timeouts {
+		diffs = append(diffs, "timeouts")
 	}
 	return strings.Join(diffs, ",")
 }

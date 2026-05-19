@@ -42,4 +42,9 @@ type Queue interface {
 	Status(ctx context.Context, ticketID string) (*Status, error)
 	Advance(ctx context.Context, n int64) error
 	Size(ctx context.Context) (int64, error)
+	// Delete removes a ticket from the queue. Returns ErrUnknownTicket
+	// when the ID is not present. Implementations use this for
+	// operator-initiated eviction (admin tools, delete-on-request) and
+	// for capping memory in long-running deployments.
+	Delete(ctx context.Context, ticketID string) error
 }

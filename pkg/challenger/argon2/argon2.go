@@ -130,7 +130,24 @@ func (c *Challenger) Verify(ctx context.Context, sol challenger.Solution) error 
 		_ = c.store.Delete(ctx, key(sol.ID))
 		return challenger.ErrUnknownID
 	}
+	// Claim a one-shot consumed marker BEFORE running Argon2id. Two
+	// concurrent Verify calls used to both Get → validate → Delete and
+	// each burned a full Argon2 computation (19 MiB / 1 thread by
+	// default). An attacker holding a single valid nonce could amplify
+	// that into arbitrary CPU/RAM cost on the server by issuing many
+	// parallel Verify requests. SetNX gives us a single winner.
+	consumedTTL := ch.ExpiresAt.Sub(c.cfg.Now())
+	if consumedTTL <= 0 {
+		consumedTTL = c.cfg.TTL
+	}
+	if err := c.store.SetNX(ctx, consumedKey(sol.ID), []byte{1}, consumedTTL); err != nil {
+		if errors.Is(err, store.ErrExists) {
+			return challenger.ErrUnknownID
+		}
+		return fmt.Errorf("argon2: claim consume: %w", err)
+	}
 	if !c.validate(ch.Payload, sol.Nonce, ch.Difficulty) {
+		_ = c.store.Delete(ctx, consumedKey(sol.ID))
 		return challenger.ErrInvalidSolution
 	}
 	if err := c.store.Delete(ctx, key(sol.ID)); err != nil {
@@ -175,7 +192,8 @@ func (c *Challenger) zeroBytesFor(hint challenger.Hint) int {
 	return c.cfg.BaseZeroBytes + int(math.Round(span*load))
 }
 
-func key(id string) string { return "argon2:" + id }
+func key(id string) string         { return "argon2:" + id }
+func consumedKey(id string) string { return "argon2:consumed:" + id }
 
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)

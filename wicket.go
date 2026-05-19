@@ -21,6 +21,9 @@
 package wicket
 
 import (
+	"bufio"
+	"context"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -47,6 +50,7 @@ type Wicket struct {
 	queue      queue.Queue
 	identity   identity.Identity
 	issuer     *admission.Issuer
+	verifier   *admission.Verifier
 	metrics    *metrics.Metrics
 	tracer     trace.Tracer
 
@@ -55,15 +59,31 @@ type Wicket struct {
 
 type Option func(*Wicket)
 
-// WithRateLimit installs a per-key token bucket limiter. Burst defaults to
-// rps if not explicitly set.
-func WithRateLimit(rps float64, per time.Duration) Option {
+// WithRateLimit installs a per-key token bucket limiter. The first
+// argument is the count allowed per `per`; the steady-state rate is
+// count/per (in seconds), and burst equals count.
+//
+// Concretely: WithRateLimit(100, time.Minute) sets a 100-token burst
+// that refills at ~1.67 tokens/sec, so a caller can fire 100 requests
+// instantly and then wait. Use WithRateLimitBurst when you want to
+// separate the steady rate from the burst budget.
+func WithRateLimit(count float64, per time.Duration) Option {
 	return func(w *Wicket) {
-		rate := rps
+		rate := count
 		if per > 0 {
-			rate = rps / per.Seconds()
+			rate = count / per.Seconds()
 		}
-		w.limiter = ratelimit.New(ratelimit.Config{Rate: rate, Burst: rps})
+		w.limiter = ratelimit.New(ratelimit.Config{Rate: rate, Burst: count})
+	}
+}
+
+// WithRateLimitBurst installs a per-key token bucket with an explicit
+// steady rate (tokens/sec) and burst (max tokens). Prefer this over
+// WithRateLimit when the steady-state rate and the maximum burst need
+// to be independently tuned.
+func WithRateLimitBurst(ratePerSec, burst float64) Option {
+	return func(w *Wicket) {
+		w.limiter = ratelimit.New(ratelimit.Config{Rate: ratePerSec, Burst: burst})
 	}
 }
 
@@ -101,6 +121,17 @@ func WithMetrics(m *metrics.Metrics) Option {
 // with an admission.Verifier sharing the same secret.
 func WithAdmissionIssuer(i *admission.Issuer) Option {
 	return func(w *Wicket) { w.issuer = i }
+}
+
+// WithAdmissionVerifier attaches an admission.Verifier. When set, the
+// /enqueue admin endpoint requires a valid, single-use admission token
+// (the one minted by /solve) in the X-Wicket-Token header before it
+// will issue a queue ticket. This is the link that turns the "PoW →
+// Queue" pipeline from documentation into an enforced flow: without
+// it, /enqueue and /solve are independent and a bot can flood /enqueue
+// without ever solving a challenge.
+func WithAdmissionVerifier(v *admission.Verifier) Option {
+	return func(w *Wicket) { w.verifier = v }
 }
 
 // WithTracer installs an OpenTelemetry tracer that emits a span for every
@@ -163,14 +194,16 @@ func New(opts ...Option) *Wicket {
 }
 
 func defaultKey(r *http.Request) string {
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		addr = addr[:i]
+	// SplitHostPort handles both IPv4 (1.2.3.4:5678) and IPv6
+	// ([::1]:8080) correctly, stripping the brackets that a naive
+	// LastIndex(":") leaves behind.
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
+		return host
 	}
-	if addr == "" {
-		return "unknown"
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
 	}
-	return addr
+	return "unknown"
 }
 
 // ProxyAwareKey returns a KeyFunc that extracts a client IP from the
@@ -245,7 +278,22 @@ func (w *Wicket) Wrap(h http.Handler) http.Handler {
 		}
 
 		sr := &statusRecorder{ResponseWriter: rw, status: http.StatusOK}
-		h.ServeHTTP(sr, r)
+		// A panic inside the downstream handler must still feed the
+		// breaker; otherwise a probe in HalfOpen has no way to learn it
+		// failed. Record the failure, then re-panic so the surrounding
+		// server's panic handler still runs.
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					sr.status = http.StatusInternalServerError
+					if w.breaker != nil {
+						w.breaker.RecordFailure()
+					}
+					panic(rec)
+				}
+			}()
+			h.ServeHTTP(sr, r)
+		}()
 
 		outcome := metrics.OutcomeAdmitted
 		if w.breaker != nil {
@@ -283,6 +331,42 @@ func (w *Wicket) recordOutcome(outcome string, start time.Time) {
 	w.metrics.RequestDuration.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
 }
 
+// currentLoad returns a normalised [0,1] load signal for adaptive
+// difficulty. It mixes the current breaker state and the queue depth
+// against a soft cap. The intent is "use whatever signals are wired
+// in" — if neither breaker nor queue is configured, load is 0 and
+// difficulty stays at base.
+func (w *Wicket) currentLoad(ctx context.Context) float64 {
+	var load float64
+	if w.breaker != nil {
+		switch w.breaker.State() {
+		case circuit.StateHalfOpen:
+			load = max64(load, 0.75)
+		case circuit.StateOpen:
+			load = 1
+		}
+	}
+	if w.queue != nil {
+		if n, err := w.queue.Size(ctx); err == nil && n > 0 {
+			// Soft cap: above 10k waiting tickets we pin to max.
+			const cap = 10_000.0
+			q := float64(n) / cap
+			if q > 1 {
+				q = 1
+			}
+			load = max64(load, q)
+		}
+	}
+	return load
+}
+
+func max64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // Challenger returns the configured bot challenger, or nil.
 func (w *Wicket) Challenger() challenger.Challenger { return w.challenger }
 
@@ -312,4 +396,34 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.NewResponseController and similar helpers reach the
+// underlying ResponseWriter so that downstream handlers can still use
+// the optional interfaces (Flusher, Hijacker, Pusher, etc.) the inner
+// writer implements. Without this, wrapping any handler that streams
+// via SSE, upgrades to WebSocket, or pushes HTTP/2 streams silently
+// breaks behind the middleware.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// Flush forwards to the inner ResponseWriter when it implements
+// http.Flusher. Required so SSE handlers downstream can flush partial
+// writes through the middleware.
+func (s *statusRecorder) Flush() {
+	if !s.wroteHeader {
+		s.status = http.StatusOK
+		s.wroteHeader = true
+	}
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack lets a downstream WebSocket handler take over the connection.
+// Returns http.ErrNotSupported when the inner writer is not hijackable.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
 }

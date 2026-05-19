@@ -336,7 +336,7 @@ func TestMerkleSingleEntry(t *testing.T) {
 	if len(path) != 0 {
 		t.Fatalf("path len = %d want 0 for single entry", len(path))
 	}
-	if !Verify(log.Root(), entry, path) {
+	if !Verify(log.Root(), log.Size(), entry, path) {
 		t.Fatal("Verify failed for single entry")
 	}
 }
@@ -356,7 +356,7 @@ func TestMerkleProofRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prove(%s): %v", id, err)
 		}
-		if !Verify(root, entry, path) {
+		if !Verify(root, log.Size(), entry, path) {
 			t.Fatalf("Verify failed for %s", id)
 		}
 	}
@@ -370,7 +370,7 @@ func TestMerkleProofRejectsWrongRoot(t *testing.T) {
 	log := q.Audit()
 	entry, path, _ := log.Prove(tk.ID)
 	bogusRoot := [32]byte{0xff}
-	if Verify(bogusRoot, entry, path) {
+	if Verify(bogusRoot, log.Size(), entry, path) {
 		t.Fatal("Verify accepted bogus root")
 	}
 }
@@ -392,8 +392,49 @@ func TestMerkleProofRejectsTamperedEntry(t *testing.T) {
 	log := q.Audit()
 	entry, path, _ := log.Prove(tk.ID)
 	entry.Score ^= 0xdeadbeef
-	if Verify(log.Root(), entry, path) {
+	if Verify(log.Root(), log.Size(), entry, path) {
 		t.Fatal("Verify accepted tampered entry")
+	}
+}
+
+// TestVerifyRejectsPositionOutOfBounds is the regression test for the
+// missing tree-size check. A forged proof that claims a position
+// outside the committed tree must be rejected even when the chain of
+// hashes happens to recover the published root.
+func TestVerifyRejectsPositionOutOfBounds(t *testing.T) {
+	q, _ := New(Config{})
+	ctx := context.Background()
+	tk, _ := q.Enqueue(ctx, "")
+	_, _ = q.Enqueue(ctx, "")
+	_, _ = q.Enqueue(ctx, "")
+	log := q.Audit()
+	entry, path, _ := log.Prove(tk.ID)
+
+	tampered := entry
+	tampered.Position = log.Size() + 1
+	if Verify(log.Root(), log.Size(), tampered, path) {
+		t.Fatal("Verify accepted out-of-bounds position")
+	}
+	tampered.Position = 0
+	if Verify(log.Root(), log.Size(), tampered, path) {
+		t.Fatal("Verify accepted zero position")
+	}
+}
+
+// TestVerifyRejectsWrongPathLength rejects proofs whose path depth
+// doesn't match the committed tree size.
+func TestVerifyRejectsWrongPathLength(t *testing.T) {
+	q, _ := New(Config{})
+	ctx := context.Background()
+	tk, _ := q.Enqueue(ctx, "")
+	_, _ = q.Enqueue(ctx, "")
+	log := q.Audit()
+	entry, path, _ := log.Prove(tk.ID)
+
+	tooLong := append([][32]byte{}, path...)
+	tooLong = append(tooLong, [32]byte{})
+	if Verify(log.Root(), log.Size(), entry, tooLong) {
+		t.Fatal("Verify accepted over-long path")
 	}
 }
 

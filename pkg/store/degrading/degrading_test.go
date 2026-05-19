@@ -176,6 +176,47 @@ func TestIncrFallbackWorks(t *testing.T) {
 	}
 }
 
+// TestRecoveryDoesNotLoseFallbackValue is the regression test for the
+// silent-loss bug: a key written during a primary outage lives only in
+// the fallback. When the primary comes back up, the first Get used to
+// hit primary, see ErrNotFound, mark healthy, and return ErrNotFound
+// to the caller — losing the value. Now Get must probe the fallback on
+// that path and return the fallback value.
+func TestRecoveryDoesNotLoseFallbackValue(t *testing.T) {
+	primary := newFlaky()
+	fallback := memory.New()
+	t.Cleanup(func() { _ = fallback.Close() })
+	now := time.Unix(0, 0)
+	s := New(primary, fallback, Config{ProbeEvery: 5 * time.Second, Now: func() time.Time { return now }})
+
+	ctx := context.Background()
+	// Outage: primary fails, write lands only in fallback.
+	primary.fail.Store(true)
+	if err := s.Set(ctx, "outage-key", []byte("survived"), 0); err != nil {
+		t.Fatalf("Set during outage: %v", err)
+	}
+	if !s.Degraded() {
+		t.Fatal("expected degraded after primary failure")
+	}
+
+	// Recovery: primary is healthy but does not know about outage-key.
+	primary.fail.Store(false)
+	now = now.Add(6 * time.Second)
+
+	got, err := s.Get(ctx, "outage-key")
+	if err != nil {
+		t.Fatalf("Get after recovery: %v (the bug)", err)
+	}
+	if string(got) != "survived" {
+		t.Fatalf("got %q want survived", got)
+	}
+	// Critically: primary returning ErrNotFound must NOT have
+	// markHealthy'd the wrapper — there's still fallback-only data.
+	if !s.Degraded() {
+		t.Fatal("wrapper marked healthy after a primary miss; recovery is premature")
+	}
+}
+
 func TestDeleteFallbackWorks(t *testing.T) {
 	primary := newFlaky()
 	fallback := memory.New()

@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -105,7 +106,26 @@ func (c *Challenger) Verify(ctx context.Context, sol challenger.Solution) error 
 		_ = c.store.Delete(ctx, key(sol.ID))
 		return challenger.ErrUnknownID
 	}
+	// Claim a one-shot consumed marker BEFORE the SHA-256 / Argon2 work
+	// in Validate. Two concurrent Verify calls with the same (id, nonce)
+	// used to both Get → Validate → Delete: the Delete is not atomic
+	// with the Get, so both copies admitted the same nonce. SetNX gives
+	// us a single winner; the loser gets ErrExists and bails out before
+	// burning the hash budget a second time.
+	consumedTTL := ch.ExpiresAt.Sub(c.cfg.Now())
+	if consumedTTL <= 0 {
+		consumedTTL = c.cfg.TTL
+	}
+	if err := c.store.SetNX(ctx, consumedKey(sol.ID), []byte{1}, consumedTTL); err != nil {
+		if errors.Is(err, store.ErrExists) {
+			return challenger.ErrUnknownID
+		}
+		return fmt.Errorf("pow: claim consume: %w", err)
+	}
 	if !Validate(ch.Payload, sol.Nonce, ch.Difficulty) {
+		// Validation failed; release the consumed marker so an honest
+		// retry with the correct nonce can still succeed.
+		_ = c.store.Delete(ctx, consumedKey(sol.ID))
 		return challenger.ErrInvalidSolution
 	}
 	if err := c.store.Delete(ctx, key(sol.ID)); err != nil {
@@ -155,7 +175,8 @@ func leadingZeroBits(b []byte) int {
 	return n
 }
 
-func key(id string) string { return "pow:" + id }
+func key(id string) string         { return "pow:" + id }
+func consumedKey(id string) string { return "pow:consumed:" + id }
 
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)

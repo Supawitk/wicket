@@ -3,8 +3,10 @@ package wicket
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/Supawitk/wicket/pkg/admission"
 	"github.com/Supawitk/wicket/pkg/challenger"
 	"github.com/Supawitk/wicket/pkg/metrics"
 )
@@ -53,7 +55,7 @@ func (w *Wicket) handleChallenge(rw http.ResponseWriter, r *http.Request) {
 		writeError(rw, http.StatusNotFound, "challenger not configured")
 		return
 	}
-	ch, err := w.challenger.Issue(r.Context(), challenger.Hint{})
+	ch, err := w.challenger.Issue(r.Context(), challenger.Hint{Load: w.currentLoad(r.Context())})
 	if err != nil {
 		writeError(rw, http.StatusInternalServerError, "issue failed")
 		return
@@ -136,6 +138,37 @@ func (w *Wicket) handleEnqueue(rw http.ResponseWriter, r *http.Request) {
 		writeError(rw, http.StatusNotFound, "queue not configured")
 		return
 	}
+	// When an admission verifier is configured, /enqueue MUST present a
+	// valid single-use admission token (issued by /solve). Without this
+	// gate, /enqueue and /solve are independent endpoints and a bot can
+	// fire /enqueue at will without ever solving a challenge. Tokens
+	// are consumed atomically inside Verify, so a replay returns
+	// ErrReplayed.
+	if w.verifier != nil {
+		token := r.Header.Get("X-Wicket-Token")
+		if token == "" {
+			writeError(rw, http.StatusUnauthorized, "admission token required")
+			return
+		}
+		if _, err := w.verifier.Verify(r.Context(), token); err != nil {
+			status := http.StatusUnauthorized
+			msg := "invalid admission token"
+			switch {
+			case errors.Is(err, admission.ErrReplayed):
+				msg = "admission token already used"
+			case errors.Is(err, admission.ErrExpired):
+				msg = "admission token expired"
+			case errors.Is(err, admission.ErrSignature),
+				errors.Is(err, admission.ErrMalformed):
+				msg = "invalid admission token"
+			default:
+				status = http.StatusInternalServerError
+				msg = "admission verify failed"
+			}
+			writeError(rw, status, msg)
+			return
+		}
+	}
 	// Drain at most maxAdminBodyBytes so a client that posts a giant body
 	// cannot exhaust memory. /enqueue ignores the body content entirely
 	// but a misbehaving client might still send one.
@@ -165,7 +198,7 @@ type statusResponse struct {
 }
 
 func (w *Wicket) handleStatus(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeError(rw, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -173,7 +206,24 @@ func (w *Wicket) handleStatus(rw http.ResponseWriter, r *http.Request) {
 		writeError(rw, http.StatusNotFound, "queue not configured")
 		return
 	}
-	ticket := r.URL.Query().Get("ticket")
+	// POST takes the ticket ID in a JSON body so it never appears in
+	// query strings, server access logs, browser history, or the
+	// Referer header that downstream pages would carry. GET is kept
+	// for backwards compatibility but should be considered deprecated
+	// for anything beyond local development.
+	var ticket string
+	if r.Method == http.MethodPost {
+		var body struct {
+			TicketID string `json:"ticket_id"`
+		}
+		if err := decodeJSON(rw, r, &body); err != nil {
+			writeError(rw, http.StatusBadRequest, "bad request")
+			return
+		}
+		ticket = body.TicketID
+	} else {
+		ticket = r.URL.Query().Get("ticket")
+	}
 	if ticket == "" {
 		writeError(rw, http.StatusBadRequest, "ticket required")
 		return

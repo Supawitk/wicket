@@ -81,6 +81,14 @@ type record struct {
 	issued   time.Time
 	preQueue bool // true if enqueued before Open(); randomised into positions 1..N at open time
 	seq      int64 // assigned for post-open arrivals to guarantee FIFO after the pre-queue
+	// keyHash is SHA-256 of the visitor key the ticket was issued for
+	// (typically client IP / fingerprint, sourced via the Wicket
+	// KeyFunc). It binds Status lookups to the requester so one
+	// visitor cannot poll another's ticket position by guessing the
+	// ID, and it folds into the ticket ID so an attacker rotating
+	// IPs cannot mint tickets that look identical to a legitimate
+	// user's. Empty when Enqueue was called with no visitor key.
+	keyHash [32]byte
 }
 
 type Queue struct {
@@ -104,6 +112,8 @@ type Queue struct {
 	opened   bool
 	preCount int64 // count of pre-queue tickets at the moment Open() was called
 	postSeq  int64 // next sequence number for post-open arrivals
+	openedAt time.Time
+	openRec  *OpenRecord
 
 	// positions maps ticket ID to its final position in the queue.
 	// It is the source of truth for Status() once built. nil means the
@@ -234,23 +244,103 @@ func (q *Queue) Revealed() bool {
 	return q.revealed
 }
 
+// OpenRecord is a signed transition record returned by Open(). The
+// operator can publish it alongside the Merkle root after the event so
+// auditors can verify when Open() fired and what the pre-queue
+// commitment was at that instant. Without this, a colluding operator
+// could time Open() to lock in favourable scores for chosen friends
+// and the audit log would have no after-the-fact way to detect it.
+//
+// Verifiers reconstruct the digest as
+//
+//	SHA-256(commitment || be64(unix_nano) || be64(preCount))
+//
+// and check that Signature is a valid Ed25519 signature of the digest
+// under the queue's PublicKey() (Ed25519 mode) or matches the seed
+// commitment chain (seed mode; Signature is nil). ECVRF mode uses the
+// ECVRF public-key bytes as the commitment.
+type OpenRecord struct {
+	Commitment [32]byte
+	OpenedAt   time.Time
+	PreCount   int64
+	// Signature is non-nil in Ed25519 mode. Seed mode has no signing
+	// key, so verifiers fall back to checking the commitment chain
+	// against the published seed reveal.
+	Signature []byte
+}
+
 // Open transitions the queue from pre-queue to FIFO mode. All tickets
-// enqueued before Open() are randomised into positions 1..N by their VRF
-// score. Tickets enqueued after Open() get a monotonic sequence number
-// and rank strictly behind all pre-queue tickets — speedy bots cannot
-// jump ahead of legitimate early arrivals.
+// enqueued before Open() are randomised into positions 1..N by their
+// VRF score. Tickets enqueued after Open() get a monotonic sequence
+// number and rank strictly behind all pre-queue tickets — speedy bots
+// cannot jump ahead of legitimate early arrivals.
 //
 // Open() is optional. If never called, the queue operates as a single
-// VRF-randomised pool (the v0.1 behaviour).
-func (q *Queue) Open() {
+// VRF-randomised pool (the v0.1 behaviour). The returned OpenRecord
+// gives auditors a signed witness to when Open() actually fired.
+func (q *Queue) Open() *OpenRecord {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.opened {
-		return
+		return nil
 	}
 	q.opened = true
 	q.preCount = int64(len(q.tickets))
+	q.openedAt = q.now()
 	q.rebuildPositionsLocked()
+
+	digest := openDigest(q.commitment, q.openedAt, q.preCount)
+	rec := &OpenRecord{
+		Commitment: q.commitment,
+		OpenedAt:   q.openedAt,
+		PreCount:   q.preCount,
+	}
+	if q.mode == ModeEd25519 && q.privKey != nil {
+		rec.Signature = ed25519.Sign(q.privKey, digest[:])
+	}
+	q.openRec = rec
+	return rec
+}
+
+// OpenRecord returns the signed transition record produced by Open().
+// Returns nil if Open() has not been called.
+func (q *Queue) OpenRecord() *OpenRecord {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.openRec == nil {
+		return nil
+	}
+	cp := *q.openRec
+	if q.openRec.Signature != nil {
+		cp.Signature = append([]byte(nil), q.openRec.Signature...)
+	}
+	return &cp
+}
+
+// VerifyOpenRecord re-derives the Open digest and checks the Ed25519
+// signature under pubKey. Returns true on a valid record. Use this
+// from an external auditor; seed-mode records have no signature and
+// must be verified by chaining commitment → seed reveal separately.
+func VerifyOpenRecord(rec *OpenRecord, pubKey ed25519.PublicKey) bool {
+	if rec == nil || rec.Signature == nil || pubKey == nil {
+		return false
+	}
+	digest := openDigest(rec.Commitment, rec.OpenedAt, rec.PreCount)
+	return ed25519.Verify(pubKey, digest[:], rec.Signature)
+}
+
+func openDigest(commitment [32]byte, openedAt time.Time, preCount int64) [32]byte {
+	h := sha256.New()
+	h.Write([]byte("wicket.vrf.open:v1"))
+	h.Write(commitment[:])
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(openedAt.UnixNano()))
+	h.Write(b[:])
+	binary.BigEndian.PutUint64(b[:], uint64(preCount))
+	h.Write(b[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 // rebuildPositionsLocked materialises the positions map from the current
@@ -270,11 +360,31 @@ func (q *Queue) Opened() bool {
 	return q.opened
 }
 
-func (q *Queue) Enqueue(_ context.Context, _ string) (*queue.Ticket, error) {
-	idBytes := make([]byte, 12)
-	if _, err := rand.Read(idBytes); err != nil {
+func (q *Queue) Enqueue(_ context.Context, visitorKey string) (*queue.Ticket, error) {
+	// Reject enqueues after the seed/key has been revealed in seed
+	// mode — at that point the seed is public and anyone could grind
+	// IDs for favourable scores.
+	q.mu.RLock()
+	revealed := q.revealed
+	q.mu.RUnlock()
+	if revealed {
+		return nil, queue.ErrClosed
+	}
+	// Mix the visitor key into the ID so the ticket ID is bound to the
+	// requester. A server-supplied random nonce keeps IDs unique for
+	// the same key across repeated enqueues.
+	idNonce := make([]byte, 8)
+	if _, err := rand.Read(idNonce); err != nil {
 		return nil, err
 	}
+	var keyHash [32]byte
+	if visitorKey != "" {
+		keyHash = sha256.Sum256([]byte(visitorKey))
+	}
+	idHash := sha256.New()
+	idHash.Write(keyHash[:])
+	idHash.Write(idNonce)
+	idBytes := idHash.Sum(nil)[:12]
 	id := hex.EncodeToString(idBytes)
 
 	var score uint64
@@ -300,7 +410,7 @@ func (q *Queue) Enqueue(_ context.Context, _ string) (*queue.Ticket, error) {
 
 	issued := q.now()
 	q.mu.Lock()
-	rec := record{score: score, proof: proof, issued: issued}
+	rec := record{score: score, proof: proof, issued: issued, keyHash: keyHash}
 	if q.opened {
 		q.postSeq++
 		rec.seq = q.postSeq
@@ -390,6 +500,23 @@ func (q *Queue) Size(_ context.Context) (int64, error) {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return int64(len(q.tickets)), nil
+}
+
+// Delete removes a ticket from the queue. The Merkle log for an
+// already-published audit is unaffected (it's a frozen snapshot at
+// Audit() time); deletes only change the live state so long-running
+// deployments can evict admitted tickets and cap memory.
+func (q *Queue) Delete(_ context.Context, ticketID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.tickets[ticketID]; !ok {
+		return queue.ErrUnknownTicket
+	}
+	delete(q.tickets, ticketID)
+	if q.positions != nil {
+		delete(q.positions, ticketID)
+	}
+	return nil
 }
 
 // Proof returns the per-ticket cryptographic proof (Ed25519 and ECVRF

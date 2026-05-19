@@ -101,6 +101,19 @@ func (q *Queue) Size(_ context.Context) (int64, error) {
 	return int64(len(q.tickets)), nil
 }
 
+// Delete removes a ticket. The numbering of remaining tickets is not
+// re-packed; their absolute positions stay stable so a downstream
+// status poll still resolves to the same place in line.
+func (q *Queue) Delete(_ context.Context, ticketID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.tickets[ticketID]; !ok {
+		return queue.ErrUnknownTicket
+	}
+	delete(q.tickets, ticketID)
+	return nil
+}
+
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

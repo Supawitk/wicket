@@ -8,9 +8,15 @@ import (
 )
 
 // MerkleLog is a tamper-evident summary of every (ticketID, score) pair in
-// the queue. Operators publish Root() after the event; any ticket holder
-// can demand a Prove(ticketID) and verify inclusion with Verify against
-// the public Root.
+// the queue. Operators publish Root() and Size() after the event; any
+// ticket holder can demand a Prove(ticketID) and verify inclusion with
+// Verify against the public (root, size) pair.
+//
+// Including the size in Verify defends against a class of attacks where
+// a malicious operator publishes a path that resolves to the root but
+// claims a position outside the committed tree (e.g. position N+1
+// derived by exploiting the duplicate-odd construction). Verifiers must
+// reject any entry whose Position is outside [1, size].
 type MerkleLog struct {
 	entries []Entry
 	leaves  [][32]byte
@@ -36,6 +42,10 @@ func (q *Queue) Audit() *MerkleLog {
 // Root returns the Merkle root, suitable for public posting.
 func (l *MerkleLog) Root() [32]byte { return l.root }
 
+// Size returns the number of entries committed in the tree. Publish
+// this alongside Root so verifiers can range-check claimed positions.
+func (l *MerkleLog) Size() int64 { return int64(len(l.entries)) }
+
 // Entries returns the full sorted ticket list. Useful when the operator
 // wants to publish the entire export alongside the root.
 func (l *MerkleLog) Entries() []Entry {
@@ -60,11 +70,27 @@ func (l *MerkleLog) Prove(ticketID string) (entry Entry, path [][32]byte, err er
 	return l.entries[idx], merklePath(l.leaves, idx), nil
 }
 
-// Verify checks a Merkle inclusion proof against a published root.
+// Verify checks a Merkle inclusion proof against a published (root,
+// size) pair.
 //
-// Given (root, entry, path) any party can confirm the entry was committed
-// without holding the full ticket list.
-func Verify(root [32]byte, entry Entry, path [][32]byte) bool {
+// Given (root, size, entry, path) any party can confirm the entry was
+// committed without holding the full ticket list. The size bound is
+// load-bearing: it rejects forged proofs that claim a position outside
+// the committed tree but happen to chain to the published root via the
+// duplicate-odd construction.
+//
+// The path length must match the depth of a tree of `size` leaves; a
+// proof that walks more or fewer levels is rejected outright.
+func Verify(root [32]byte, size int64, entry Entry, path [][32]byte) bool {
+	if size <= 0 {
+		return false
+	}
+	if entry.Position < 1 || entry.Position > size {
+		return false
+	}
+	if expected := treeDepth(size); len(path) != expected {
+		return false
+	}
 	cur := leafHash(entry)
 	idx := entry.Position - 1
 	for _, sibling := range path {
@@ -76,6 +102,20 @@ func Verify(root [32]byte, entry Entry, path [][32]byte) bool {
 		idx /= 2
 	}
 	return cur == root
+}
+
+// treeDepth returns the number of levels between a leaf and the root
+// for a tree of size leaves under the duplicate-odd construction.
+// size == 1 has depth 0 (the leaf IS the root).
+func treeDepth(size int64) int {
+	if size <= 1 {
+		return 0
+	}
+	d := 0
+	for n := size; n > 1; n = (n + 1) / 2 {
+		d++
+	}
+	return d
 }
 
 func leafHash(e Entry) [32]byte {
