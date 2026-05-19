@@ -237,25 +237,6 @@ Wicket is built on proven, boring infrastructure. Nothing experimental.
 
 ---
 
-## Benchmarks
-
-`go test -bench=. -benchmem ./bench/` produces reproducible numbers on your hardware. The values below were captured on an Intel i7-9750H, Go 1.26.3, darwin/amd64. They are useful for regression detection and for comparing relative cost between modes; they are not a claim about absolute throughput on production hardware.
-
-| Benchmark | ns/op | allocs |
-|---|---:|---:|
-| Baseline `httptest` request | 62 433 | 54 |
-| Wicket Wrap, rate limit only | 63 378 | 55 |
-| Wicket Wrap, rate limit + breaker | 63 256 | 55 |
-| VRF Enqueue, seed mode | 1 362 | 3 |
-| VRF Enqueue, Ed25519 mode | 26 214 | 3 |
-| VRF Enqueue, ECVRF (RFC 9381) | 169 110 | 11 |
-| VRF Status (rank over 1000 tickets) | 21 589 | 1 |
-| Merkle Audit + Prove (1000 tickets) | 1 535 912 | 3035 |
-
-The Wicket middleware adds roughly 1 µs over the `net/http` baseline. Modes with stronger cryptographic guarantees are progressively more expensive — pick the lightest mode that satisfies your fairness requirement.
-
----
-
 ## Contributing
 
 Contributions welcome. Open an issue before starting on anything beyond a small fix so we can confirm direction. PRs must include tests next to the code they cover and pass `make test lint`.
