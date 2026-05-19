@@ -21,20 +21,6 @@ It bundles a queue, an adaptive proof-of-work challenge, a rate limiter, a circu
 
 ---
 
-## Why Wicket?
-
-Existing options each solve part of the problem:
-
-- **Cloudflare Waiting Room** — managed, expensive, sees all your traffic.
-- **Queue-it** — premium, closed source.
-- **Anubis** — proof-of-work only, AI-scraper focused.
-- **mCaptcha** — proof-of-work captcha, no queue.
-- **Envoy / Istio** — rate limit at the mesh level, no waiting room.
-
-Wicket combines them in one self-hosted binary, adds a cryptographically verifiable fair queue, and exposes a clean Go API.
-
----
-
 ## Features
 
 - 🎟️ **Verifiable-fair queue** — two modes. Ed25519 mode (default) gives every ticket a per-ticket cryptographic proof a client can verify on its own. Seed mode supports classic commit-reveal with an externally-supplied seed.
