@@ -65,16 +65,37 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return s.c.Del(ctx, key).Err()
 }
 
+// incrExpireScript atomically increments key and, on the creating call,
+// sets the TTL in a single round trip. Doing this as two commands (INCR
+// then EXPIRE) is racy: a process crash or connection drop between them
+// leaves the counter without a TTL, turning a rolling-window rate limit
+// into an all-time counter. Running both inside a single Redis script
+// makes the pair indivisible on the server side.
+var incrExpireScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if tonumber(ARGV[1]) > 0 and n == 1 then
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`)
+
 func (s *Store) Incr(ctx context.Context, key string, ttl time.Duration) (int64, error) {
-	n, err := s.c.Incr(ctx, key).Result()
+	if ttl <= 0 {
+		// No TTL requested: a plain INCR is sufficient and avoids the
+		// script-load round trip on cold caches.
+		n, err := s.c.Incr(ctx, key).Result()
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+	res, err := incrExpireScript.Run(ctx, s.c, []string{key}, ttl.Milliseconds()).Result()
 	if err != nil {
 		return 0, err
 	}
-	if ttl > 0 && n == 1 {
-		// Only set the expiry on creation to preserve the rolling window.
-		if err := s.c.Expire(ctx, key, ttl).Err(); err != nil {
-			return 0, err
-		}
+	n, ok := res.(int64)
+	if !ok {
+		return 0, errors.New("redis: incr script returned non-integer")
 	}
 	return n, nil
 }

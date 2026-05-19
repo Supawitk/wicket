@@ -142,6 +142,65 @@ func TestBuildHandlerComposes(t *testing.T) {
 	}
 }
 
+// TestHotReloadPreservesLimiter is the regression test for the rate-limit
+// reset on hot reload. Two buildHandler calls with the same rate_limit
+// config must reuse the same *TokenBucket — otherwise an attacker can
+// trigger an unrelated config edit during a flood and get a fresh burst
+// quota every time.
+func TestHotReloadPreservesLimiter(t *testing.T) {
+	c := &config{Upstream: "http://x"}
+	c.RateLimit.RPS = 10
+	s, err := buildStatic(c)
+	if err != nil {
+		t.Fatalf("buildStatic: %v", err)
+	}
+	if _, err := buildHandler(c, s); err != nil {
+		t.Fatalf("buildHandler 1: %v", err)
+	}
+	first := s.limiter
+	if first == nil {
+		t.Fatal("limiter not cached after first build")
+	}
+
+	// Simulate a hot reload that doesn't touch rate_limit.
+	c2 := *c
+	if _, err := buildHandler(&c2, s); err != nil {
+		t.Fatalf("buildHandler 2: %v", err)
+	}
+	if s.limiter != first {
+		t.Fatal("limiter rebuilt despite unchanged rate_limit config")
+	}
+
+	// Now flip an RPS field — must rebuild.
+	c3 := *c
+	c3.RateLimit.RPS = 20
+	if _, err := buildHandler(&c3, s); err != nil {
+		t.Fatalf("buildHandler 3: %v", err)
+	}
+	if s.limiter == first {
+		t.Fatal("limiter not rebuilt despite rate_limit config change")
+	}
+}
+
+// TestStoreBackendRedisRequiresAddr guards the sidecar against a config
+// that asks for the Redis backend but omits the address — previously
+// the build would silently fall back to in-memory.
+func TestStoreBackendRedisRequiresAddr(t *testing.T) {
+	c := &config{Upstream: "http://x"}
+	c.Store.Backend = "redis"
+	if _, err := buildStatic(c); err == nil {
+		t.Fatal("expected error for redis backend with empty addr")
+	}
+}
+
+func TestStoreBackendUnknown(t *testing.T) {
+	c := &config{Upstream: "http://x"}
+	c.Store.Backend = "etcd"
+	if _, err := buildStatic(c); err == nil {
+		t.Fatal("expected error for unknown store backend")
+	}
+}
+
 func TestStaticDiff(t *testing.T) {
 	a := &config{Upstream: "http://a", Listen: ":8080"}
 	b := &config{Upstream: "http://b", Listen: ":8080"}

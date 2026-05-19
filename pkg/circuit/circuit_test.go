@@ -182,6 +182,77 @@ func TestRollingWindowPartialDecay(t *testing.T) {
 	}
 }
 
+// TestConsecutiveFailuresTrip is the regression test for the high-throughput
+// hide-the-outage bug: a service that has accumulated millions of successes
+// in the current rolling-window bucket cannot trip on a 100% failure burst
+// via the ratio path alone, because the burst lands in the same bucket as
+// the successes and the ratio stays well below threshold. ConsecutiveFailures
+// catches it.
+func TestConsecutiveFailuresTrip(t *testing.T) {
+	now := time.Unix(0, 0)
+	cfg := Config{
+		FailureRatio:        0.5,
+		MinSamples:          20,
+		Cooldown:            time.Minute,
+		HalfOpenMax:         2,
+		Window:              10 * time.Second,
+		WindowBuckets:       10,
+		ConsecutiveFailures: 50,
+		Now:                 func() time.Time { return now },
+	}
+	b := New(cfg)
+
+	// Frozen clock: 36M successes all in the current bucket.
+	for i := 0; i < 36_000_000; i++ {
+		_ = b.Allow()
+		b.RecordSuccess()
+	}
+	if b.State() != StateClosed {
+		t.Fatalf("after 36M successes state = %v want closed", b.State())
+	}
+
+	// 50 consecutive failures must trip even though the ratio is well
+	// below FailureRatio (50/36000050 ≈ 0.000001).
+	for i := 0; i < 50; i++ {
+		_ = b.Allow()
+		b.RecordFailure()
+	}
+	if b.State() != StateOpen {
+		t.Fatalf("state = %v want open (ConsecutiveFailures must trip)", b.State())
+	}
+}
+
+// TestConsecutiveFailuresResetOnSuccess confirms the consecutive counter
+// resets on any success — so a long-running service interleaving rare
+// failures with successes does not slowly accumulate toward the trip.
+func TestConsecutiveFailuresResetOnSuccess(t *testing.T) {
+	now := time.Unix(0, 0)
+	cfg := Config{
+		FailureRatio:        0.99,
+		MinSamples:          1_000_000,
+		Cooldown:            time.Minute,
+		HalfOpenMax:         2,
+		Window:              10 * time.Second,
+		WindowBuckets:       10,
+		ConsecutiveFailures: 5,
+		Now:                 func() time.Time { return now },
+	}
+	b := New(cfg)
+
+	// 4 failures, 1 success, repeated — never 5 in a row.
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 4; j++ {
+			_ = b.Allow()
+			b.RecordFailure()
+		}
+		_ = b.Allow()
+		b.RecordSuccess()
+	}
+	if b.State() != StateClosed {
+		t.Fatalf("state = %v want closed (consec must reset on success)", b.State())
+	}
+}
+
 func TestHalfOpenCapsProbes(t *testing.T) {
 	b, now := newTestBreaker()
 	for i := 0; i < 4; i++ {

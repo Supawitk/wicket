@@ -141,6 +141,60 @@ func TestIssueChallengeRejectsUnknownCredential(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsCrossCredentialChallenge is the regression test for the
+// DoS that lets Alice consume Bob's challenge with her own credential.
+// Without the binding, Alice signs the stored payload with her own key
+// (the verifier reads it back and accepts her signature), and Bob's
+// challenge is deleted out from under him. With the binding, Verify must
+// return ErrChallengeMismatch and leave Bob's challenge intact.
+func TestVerifyRejectsCrossCredentialChallenge(t *testing.T) {
+	v := newTestVerifier(t)
+	ctx := context.Background()
+
+	alicePriv, _ := register(t, v, "alice")
+	_, _ = register(t, v, "bob")
+
+	bobChal, err := v.IssueChallenge(ctx, "bob")
+	if err != nil {
+		t.Fatalf("IssueChallenge bob: %v", err)
+	}
+
+	// Alice signs Bob's challenge payload with her own private key and
+	// presents her own credential ID.
+	sig := ed25519.Sign(alicePriv, bobChal.Payload)
+	proof, _ := json.Marshal(Proof{
+		CredentialID: "alice",
+		ChallengeID:  bobChal.ID,
+		Signature:    hex.EncodeToString(sig),
+	})
+	_, err = v.Verify(ctx, "concert", proof)
+	if !errors.Is(err, ErrChallengeMismatch) {
+		t.Fatalf("got %v want ErrChallengeMismatch", err)
+	}
+
+	// Bob's challenge must still be consumable by Bob.
+	bobPriv, _ := register(t, v, "bob-2")
+	bobChal2, err := v.IssueChallenge(ctx, "bob-2")
+	if err != nil {
+		t.Fatalf("IssueChallenge bob-2: %v", err)
+	}
+	bobSig := ed25519.Sign(bobPriv, bobChal2.Payload)
+	bobProof, _ := json.Marshal(Proof{
+		CredentialID: "bob-2",
+		ChallengeID:  bobChal2.ID,
+		Signature:    hex.EncodeToString(bobSig),
+	})
+	if _, err := v.Verify(ctx, "concert", bobProof); err != nil {
+		t.Fatalf("Verify bob-2 after mismatch attempt: %v", err)
+	}
+
+	// Bob's original challenge must NOT have been consumed by Alice's
+	// failed attempt — otherwise the bug is reachable as a DoS.
+	if _, err := v.chals.Get(ctx, chalKey(bobChal.ID)); err != nil {
+		t.Fatalf("bob's original challenge was deleted by Alice's attempt: %v", err)
+	}
+}
+
 func TestIssueChallengeIDsAreUnique(t *testing.T) {
 	v := newTestVerifier(t)
 	_, _ = register(t, v, "cred-5")

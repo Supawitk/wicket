@@ -139,6 +139,39 @@ func TestEvictionPreservesActiveKeys(t *testing.T) {
 	}
 }
 
+// TestMillionUniqueKeysEvict is the regression test for the
+// rotating-IP / spoofed-IP memory exhaustion: after one million distinct
+// keys touch the limiter once each and the IdleTTL elapses, the map must
+// drop back to a near-empty steady state. The earlier failure mode was a
+// 100MB resident set held permanently with no eviction path.
+func TestMillionUniqueKeysEvict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 1M-key sweep test in -short mode")
+	}
+	now := time.Unix(0, 0)
+	l := New(Config{
+		Rate:          1,
+		Burst:         1,
+		IdleTTL:       time.Minute,
+		SweepInterval: 30 * time.Second,
+		Now:           func() time.Time { return now },
+	})
+
+	const N = 1_000_000
+	for i := 0; i < N; i++ {
+		l.Allow(fmt.Sprintf("ip-%d", i))
+	}
+	if got := l.Size(); got != N {
+		t.Fatalf("after %d keys Size=%d want %d", N, got, N)
+	}
+
+	now = now.Add(2 * time.Minute)
+	l.Allow("trigger")
+	if got := l.Size(); got != 1 {
+		t.Fatalf("after sweep Size=%d want 1", got)
+	}
+}
+
 // TestEvictionDisabled confirms IdleTTL<0 turns the sweep off entirely so
 // callers with a bounded key set keep the previous (leak-but-fast) shape.
 func TestEvictionDisabled(t *testing.T) {

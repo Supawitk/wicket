@@ -55,6 +55,14 @@ type Config struct {
 	// memory. Defaults to 10.
 	WindowBuckets int
 
+	// ConsecutiveFailures trips the breaker immediately after this many
+	// failures land in a row, regardless of the ratio computed over the
+	// rolling window. This catches the high-throughput case where a long
+	// run of successes inflates the denominator so much that even a
+	// 100% failure burst cannot cross FailureRatio within a single
+	// bucket. Zero (the default) disables the consecutive-failure trip.
+	ConsecutiveFailures int64
+
 	Now func() time.Time
 }
 
@@ -94,6 +102,10 @@ type Breaker struct {
 	halfOpenSucc int64
 	probe        int64
 	openAt       time.Time
+
+	// consecFailures counts failures since the last success while the
+	// breaker is Closed. Reset on any RecordSuccess.
+	consecFailures int64
 }
 
 func New(cfg Config) *Breaker {
@@ -158,6 +170,7 @@ func (b *Breaker) RecordSuccess() {
 	case StateClosed:
 		b.advanceLocked(b.cfg.Now())
 		b.buckets[b.currentIdx].success++
+		b.consecFailures = 0
 	case StateHalfOpen:
 		b.halfOpenSucc++
 		if b.halfOpenSucc >= b.cfg.HalfOpenMax {
@@ -174,6 +187,11 @@ func (b *Breaker) RecordFailure() {
 		now := b.cfg.Now()
 		b.advanceLocked(now)
 		b.buckets[b.currentIdx].failure++
+		b.consecFailures++
+		if b.cfg.ConsecutiveFailures > 0 && b.consecFailures >= b.cfg.ConsecutiveFailures {
+			b.transitionLocked(StateOpen)
+			return
+		}
 		failure, total := b.sumLocked()
 		if total >= b.cfg.MinSamples && float64(failure)/float64(total) >= b.cfg.FailureRatio {
 			b.transitionLocked(StateOpen)
@@ -234,6 +252,7 @@ func (b *Breaker) transitionLocked(next State) {
 	b.currentStart = b.cfg.Now()
 	b.halfOpenSucc = 0
 	b.probe = 0
+	b.consecFailures = 0
 	if next == StateOpen {
 		b.openAt = b.cfg.Now()
 	}

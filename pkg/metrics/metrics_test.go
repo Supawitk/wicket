@@ -58,16 +58,32 @@ func TestRegisterNilReg(t *testing.T) {
 func TestObserveHistogram(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewWith(reg)
-	m.RequestDuration.Observe(0.005)
-	m.RequestDuration.Observe(0.05)
+	m.RequestDuration.WithLabelValues(OutcomeAdmitted).Observe(0.005)
+	m.RequestDuration.WithLabelValues(OutcomeAdmitted).Observe(0.05)
+	m.RequestDuration.WithLabelValues(OutcomeRateLimited).Observe(0.001)
 	mfs, _ := reg.Gather()
 	for _, mf := range mfs {
 		if mf.GetName() == "wicket_request_duration_seconds" {
-			if len(mf.Metric) != 1 {
-				t.Fatalf("histogram metric count = %d", len(mf.Metric))
+			// One series per outcome label value observed.
+			if len(mf.Metric) != 2 {
+				t.Fatalf("histogram series count = %d want 2", len(mf.Metric))
 			}
-			if got := mf.Metric[0].GetHistogram().GetSampleCount(); got != 2 {
-				t.Fatalf("sample count = %d", got)
+			var admitted, rateLimited uint64
+			for _, met := range mf.Metric {
+				for _, lp := range met.GetLabel() {
+					if lp.GetName() != "outcome" {
+						continue
+					}
+					switch lp.GetValue() {
+					case OutcomeAdmitted:
+						admitted = met.GetHistogram().GetSampleCount()
+					case OutcomeRateLimited:
+						rateLimited = met.GetHistogram().GetSampleCount()
+					}
+				}
+			}
+			if admitted != 2 || rateLimited != 1 {
+				t.Fatalf("admitted=%d rateLimited=%d want 2/1", admitted, rateLimited)
 			}
 			return
 		}

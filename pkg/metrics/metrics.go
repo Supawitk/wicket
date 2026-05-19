@@ -8,14 +8,18 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 type Metrics struct {
-	RequestsTotal      *prometheus.CounterVec
-	RequestDuration    prometheus.Histogram
-	BreakerState       prometheus.Gauge
-	QueueSize          prometheus.Gauge
-	QueueCursor        prometheus.Gauge
-	ChallengeIssued    prometheus.Counter
-	ChallengeVerified  *prometheus.CounterVec
-	StoreDegraded      prometheus.Gauge
+	RequestsTotal     *prometheus.CounterVec
+	// RequestDuration is labelled by outcome so dashboards can separate
+	// admitted-request latency from rate_limited / breaker_open paths.
+	// Mixing them into a single histogram makes a backend-latency
+	// regression invisible whenever it is masked by faster reject paths.
+	RequestDuration   *prometheus.HistogramVec
+	BreakerState      prometheus.Gauge
+	QueueSize         prometheus.Gauge
+	QueueCursor       prometheus.Gauge
+	ChallengeIssued   prometheus.Counter
+	ChallengeVerified *prometheus.CounterVec
+	StoreDegraded     prometheus.Gauge
 }
 
 // Outcomes for RequestsTotal.
@@ -46,12 +50,12 @@ func NewWith(reg prometheus.Registerer) *Metrics {
 			Name:      "requests_total",
 			Help:      "Requests classified by Wicket outcome.",
 		}, []string{"outcome"}),
-		RequestDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "wicket",
 			Name:      "request_duration_seconds",
-			Help:      "Latency of the admission pipeline plus the wrapped handler.",
+			Help:      "Latency of the admission pipeline plus the wrapped handler, by outcome.",
 			Buckets:   prometheus.DefBuckets,
-		}),
+		}, []string{"outcome"}),
 		BreakerState: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "wicket",
 			Name:      "breaker_state",

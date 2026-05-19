@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -43,7 +44,9 @@ import (
 	"github.com/Supawitk/wicket/pkg/queue/fifo"
 	"github.com/Supawitk/wicket/pkg/queue/vrf"
 	"github.com/Supawitk/wicket/pkg/ratelimit"
+	"github.com/Supawitk/wicket/pkg/store"
 	"github.com/Supawitk/wicket/pkg/store/memory"
+	redisstore "github.com/Supawitk/wicket/pkg/store/redis"
 )
 
 type config struct {
@@ -85,10 +88,29 @@ type config struct {
 	} `yaml:"metrics"`
 
 	Tracing struct {
-		Enabled  bool   `yaml:"enabled"`
-		Endpoint string `yaml:"otlp_http_endpoint"` // e.g. http://otel-collector:4318
-		Service  string `yaml:"service_name"`
+		Enabled  bool    `yaml:"enabled"`
+		Endpoint string  `yaml:"otlp_http_endpoint"` // e.g. http://otel-collector:4318
+		Service  string  `yaml:"service_name"`
+		// SamplingRatio is the fraction of root spans to record. Zero
+		// (the default) means 1% (TraceIDRatioBased(0.01)); set to 1.0
+		// to record every span, or to a negative value to fall back to
+		// AlwaysOff. The sampler is ParentBased so a sampled parent
+		// keeps its children sampled across propagation boundaries.
+		SamplingRatio float64 `yaml:"sampling_ratio"`
 	} `yaml:"tracing"`
+
+	Store struct {
+		// Backend selects the store implementation that backs the PoW
+		// challenger and identity verifier. "" or "memory" keeps the
+		// previous single-process semantics; "redis" lets multiple
+		// sidecar replicas share state.
+		Backend string `yaml:"backend"`
+		Redis   struct {
+			Addr     string `yaml:"addr"`
+			Password string `yaml:"password"`
+			DB       int    `yaml:"db"`
+		} `yaml:"redis"`
+	} `yaml:"store"`
 }
 
 // staticParts is what we build once at startup and never replace.
@@ -100,6 +122,14 @@ type staticParts struct {
 	metrics        *metrics.Metrics
 	tracer         trace.Tracer
 	tracerProvider *sdktrace.TracerProvider
+	store          store.Store
+
+	// limiter is preserved across hot reloads so an in-flight rate-limit
+	// attack cannot reset every token bucket by triggering a config
+	// reload on an unrelated field. It is rebuilt only when the
+	// rate_limit section itself changes.
+	limiter   *ratelimit.TokenBucket
+	limiterMu sync.Mutex
 }
 
 func main() {
@@ -195,6 +225,11 @@ func buildStatic(cfg *config) (*staticParts, error) {
 		return nil, fmt.Errorf("parse upstream: %w", err)
 	}
 
+	st, err := buildStore(&cfg.Store)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+
 	var chal challenger.Challenger
 	if cfg.PoW.Enabled {
 		switch cfg.PoW.Algorithm {
@@ -209,7 +244,7 @@ func buildStatic(cfg *config) (*staticParts, error) {
 			if cfg.PoW.Argon2Memory > 0 {
 				acfg.Memory = cfg.PoW.Argon2Memory
 			}
-			chal = argon2.New(memory.New(), acfg)
+			chal = argon2.New(st, acfg)
 		case "", "sha256":
 			pcfg := pow.DefaultConfig()
 			if cfg.PoW.BaseDifficulty > 0 {
@@ -218,7 +253,7 @@ func buildStatic(cfg *config) (*staticParts, error) {
 			if cfg.PoW.MaxDifficulty > 0 {
 				pcfg.MaxDifficulty = cfg.PoW.MaxDifficulty
 			}
-			chal = pow.New(memory.New(), pcfg)
+			chal = pow.New(st, pcfg)
 		default:
 			return nil, fmt.Errorf("unknown pow.algorithm %q", cfg.PoW.Algorithm)
 		}
@@ -259,7 +294,7 @@ func buildStatic(cfg *config) (*staticParts, error) {
 	var tp *sdktrace.TracerProvider
 	if cfg.Tracing.Enabled {
 		var err error
-		tp, err = newTracerProvider(cfg.Tracing.Endpoint, cfg.Tracing.Service)
+		tp, err = newTracerProvider(cfg.Tracing.Endpoint, cfg.Tracing.Service, cfg.Tracing.SamplingRatio)
 		if err != nil {
 			return nil, fmt.Errorf("tracing: %w", err)
 		}
@@ -275,10 +310,40 @@ func buildStatic(cfg *config) (*staticParts, error) {
 		metrics:        m,
 		tracer:         tracer,
 		tracerProvider: tp,
+		store:          st,
 	}, nil
 }
 
-func newTracerProvider(endpoint, service string) (*sdktrace.TracerProvider, error) {
+// buildStore constructs the store.Store backing PoW challenges (and, in
+// the future, identity nullifiers). "redis" makes the sidecar usable
+// horizontally — without it, two replicas serve disjoint challenge sets
+// and the issue/verify round trip can land on the wrong replica.
+func buildStore(cfg *struct {
+	Backend string `yaml:"backend"`
+	Redis   struct {
+		Addr     string `yaml:"addr"`
+		Password string `yaml:"password"`
+		DB       int    `yaml:"db"`
+	} `yaml:"redis"`
+}) (store.Store, error) {
+	switch cfg.Backend {
+	case "", "memory":
+		return memory.New(), nil
+	case "redis":
+		if cfg.Redis.Addr == "" {
+			return nil, fmt.Errorf("store.redis.addr is required when backend=redis")
+		}
+		return redisstore.New(redisstore.Config{
+			Addr:     cfg.Redis.Addr,
+			Password: cfg.Redis.Password,
+			DB:       cfg.Redis.DB,
+		}), nil
+	default:
+		return nil, fmt.Errorf("unknown store.backend %q", cfg.Backend)
+	}
+}
+
+func newTracerProvider(endpoint, service string, samplingRatio float64) (*sdktrace.TracerProvider, error) {
 	if endpoint == "" {
 		// stdout fallback would be noisy; require an endpoint for now.
 		return nil, fmt.Errorf("tracing.otlp_http_endpoint is required when tracing is enabled")
@@ -294,24 +359,40 @@ func newTracerProvider(endpoint, service string) (*sdktrace.TracerProvider, erro
 	if err != nil {
 		return nil, err
 	}
+	// 100% sampling at high RPS overwhelms an OTLP collector. Default to
+	// 1% via TraceIDRatioBased, wrap in ParentBased so a sampled upstream
+	// keeps its descendants sampled across the boundary.
+	var sampler sdktrace.Sampler
+	switch {
+	case samplingRatio < 0:
+		sampler = sdktrace.NeverSample()
+	case samplingRatio == 0:
+		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0.01))
+	case samplingRatio >= 1:
+		sampler = sdktrace.ParentBased(sdktrace.AlwaysSample())
+	default:
+		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(samplingRatio))
+	}
 	return sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
+		sdktrace.WithSampler(sampler),
 	), nil
 }
 
 func buildHandler(cfg *config, static *staticParts) (http.Handler, error) {
 	opts := []wicket.Option{}
 	if cfg.RateLimit.RPS > 0 {
-		lcfg := ratelimit.Config{
-			Rate:          cfg.RateLimit.RPS,
-			Burst:         cfg.RateLimit.Burst,
-			IdleTTL:       cfg.RateLimit.IdleTTL,
-			SweepInterval: cfg.RateLimit.SweepInterval,
-		}
-		if lcfg.Burst <= 0 {
-			lcfg.Burst = lcfg.Rate
-		}
-		opts = append(opts, wicket.WithLimiter(ratelimit.New(lcfg)))
+		// Reuse the existing limiter when the rate-limit section is
+		// unchanged. Without this, every hot reload — even one that
+		// only touches an unrelated section — would zero every token
+		// bucket and let an in-flight rate-limit attack reset to a
+		// fresh burst quota.
+		limiter := getOrBuildLimiter(static, cfg.RateLimit)
+		opts = append(opts, wicket.WithLimiter(limiter))
+	} else {
+		// RPS was set previously but is now zero: drop the cached
+		// limiter so re-enabling later starts fresh with the new rate.
+		clearLimiter(static)
 	}
 	if cfg.CircuitBreaker.FailureRatio > 0 || cfg.CircuitBreaker.MinSamples > 0 {
 		bcfg := circuit.DefaultConfig()
@@ -423,6 +504,55 @@ func watchConfig(ctx context.Context, path string, static *staticParts, apply fu
 	}
 }
 
+// getOrBuildLimiter returns the cached rate limiter when its config has
+// not changed; otherwise it builds a new one. Returning the same
+// *TokenBucket across reloads preserves every per-key bucket — without
+// this, a hot reload during an attack hands every offender a fresh
+// burst quota.
+func getOrBuildLimiter(static *staticParts, rl struct {
+	RPS           float64       `yaml:"rps"`
+	Burst         float64       `yaml:"burst"`
+	IdleTTL       time.Duration `yaml:"idle_ttl"`
+	SweepInterval time.Duration `yaml:"sweep_interval"`
+}) *ratelimit.TokenBucket {
+	static.limiterMu.Lock()
+	defer static.limiterMu.Unlock()
+
+	lcfg := ratelimit.Config{
+		Rate:          rl.RPS,
+		Burst:         rl.Burst,
+		IdleTTL:       rl.IdleTTL,
+		SweepInterval: rl.SweepInterval,
+	}
+	if lcfg.Burst <= 0 {
+		lcfg.Burst = lcfg.Rate
+	}
+	if static.limiter == nil || !sameLimiterCfg(static.cfg.RateLimit, rl) {
+		static.limiter = ratelimit.New(lcfg)
+	}
+	// Snapshot the new rate-limit config so the next reload can compare.
+	static.cfg.RateLimit = rl
+	return static.limiter
+}
+
+func clearLimiter(static *staticParts) {
+	static.limiterMu.Lock()
+	defer static.limiterMu.Unlock()
+	static.limiter = nil
+}
+
+func sameLimiterCfg(a, b struct {
+	RPS           float64       `yaml:"rps"`
+	Burst         float64       `yaml:"burst"`
+	IdleTTL       time.Duration `yaml:"idle_ttl"`
+	SweepInterval time.Duration `yaml:"sweep_interval"`
+}) bool {
+	return a.RPS == b.RPS &&
+		a.Burst == b.Burst &&
+		a.IdleTTL == b.IdleTTL &&
+		a.SweepInterval == b.SweepInterval
+}
+
 // changedStatic reports whether any field that requires a restart
 // differs between old and new configs.
 func changedStatic(a, b *config) bool {
@@ -445,6 +575,12 @@ func staticDiff(a, b *config) string {
 	}
 	if a.Metrics != b.Metrics {
 		diffs = append(diffs, "metrics")
+	}
+	if a.Store != b.Store {
+		diffs = append(diffs, "store")
+	}
+	if a.Tracing != b.Tracing {
+		diffs = append(diffs, "tracing")
 	}
 	return strings.Join(diffs, ",")
 }

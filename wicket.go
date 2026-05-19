@@ -280,7 +280,7 @@ func (w *Wicket) recordOutcome(outcome string, start time.Time) {
 		return
 	}
 	w.metrics.RequestsTotal.WithLabelValues(outcome).Inc()
-	w.metrics.RequestDuration.Observe(time.Since(start).Seconds())
+	w.metrics.RequestDuration.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
 }
 
 // Challenger returns the configured bot challenger, or nil.
