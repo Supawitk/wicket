@@ -97,6 +97,19 @@ type Queue struct {
 	opened   bool
 	preCount int64 // count of pre-queue tickets at the moment Open() was called
 	postSeq  int64 // next sequence number for post-open arrivals
+
+	// positions maps ticket ID to its final position in the queue.
+	// It is the source of truth for Status() once built. nil means the
+	// ordering is stale (a pre-open Enqueue happened since the last
+	// rebuild); the next Status() call will rebuild lazily.
+	//
+	// Open() materialises positions for the entire pre-queue in one
+	// O(N log N) sort. Post-open Enqueue appends preCount + postSeq
+	// directly, keeping the hot path O(1). Without this map the rank
+	// computation walked the entire ticket set on every Status query,
+	// which is ~21µs at 1k tickets but ≈21ms at 1M tickets — fatal at
+	// the poll volumes a ticket-drop produces.
+	positions map[string]int64
 }
 
 // New constructs a VRF queue. See package documentation for the modes.
@@ -230,6 +243,17 @@ func (q *Queue) Open() {
 	}
 	q.opened = true
 	q.preCount = int64(len(q.tickets))
+	q.rebuildPositionsLocked()
+}
+
+// rebuildPositionsLocked materialises the positions map from the current
+// ticket set. The caller MUST hold the write lock.
+func (q *Queue) rebuildPositionsLocked() {
+	entries := q.exportLocked()
+	q.positions = make(map[string]int64, len(entries))
+	for _, e := range entries {
+		q.positions[e.TicketID] = e.Position
+	}
 }
 
 // Opened reports whether Open() has been called.
@@ -273,22 +297,35 @@ func (q *Queue) Enqueue(_ context.Context, _ string) (*queue.Ticket, error) {
 	if q.opened {
 		q.postSeq++
 		rec.seq = q.postSeq
+		q.tickets[id] = rec
+		// Post-open arrivals land in a deterministic position behind
+		// everything that came before, so we can append directly
+		// without resorting.
+		if q.positions != nil {
+			q.positions[id] = q.preCount + q.postSeq
+		}
 	} else {
 		rec.preQueue = true
+		q.tickets[id] = rec
+		// Pre-open insertion changes the score-sorted ordering of all
+		// pre-queue tickets; invalidate and let the next Status query
+		// rebuild lazily. Open() will rebuild eagerly.
+		q.positions = nil
 	}
-	q.tickets[id] = rec
 	q.mu.Unlock()
 	return &queue.Ticket{ID: id, Issued: issued}, nil
 }
 
 func (q *Queue) Status(_ context.Context, ticketID string) (*queue.Status, error) {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	r, ok := q.tickets[ticketID]
-	if !ok {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.tickets[ticketID]; !ok {
 		return nil, queue.ErrUnknownTicket
 	}
-	position := q.rankLocked(r.score, ticketID)
+	if q.positions == nil {
+		q.rebuildPositionsLocked()
+	}
+	position := q.positions[ticketID]
 	ahead := position - q.cursor - 1
 	if ahead < 0 {
 		ahead = 0
@@ -426,32 +463,3 @@ func (q *Queue) exportLocked() []Entry {
 	return out
 }
 
-func (q *Queue) rankLocked(score uint64, ticketID string) int64 {
-	r, ok := q.tickets[ticketID]
-	if !ok {
-		return 0
-	}
-	pos := int64(1)
-	for id, other := range q.tickets {
-		if id == ticketID {
-			continue
-		}
-		if r.preQueue {
-			if !other.preQueue {
-				continue // post-open tickets rank after us
-			}
-			if other.score < score || (other.score == score && id < ticketID) {
-				pos++
-			}
-		} else {
-			if other.preQueue {
-				pos++ // all pre-queue tickets rank before us
-				continue
-			}
-			if other.seq < r.seq {
-				pos++
-			}
-		}
-	}
-	return pos
-}

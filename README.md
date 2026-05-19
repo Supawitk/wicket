@@ -106,12 +106,16 @@ queue:
 
 rate_limit:
   rps: 100
+  # idle_ttl: 10m       # evict per-key buckets idle for this long (default 10m, -1 disables)
+  # sweep_interval: 1m  # how often the sweep runs (default idle_ttl/10, capped at 1m)
 
 circuit_breaker:
   failure_ratio: 0.5
   min_samples: 20
   cooldown: 30s
   half_open_max: 3
+  # window: 10s         # rolling window over which the ratio is computed (default 10s)
+  # window_buckets: 10  # subdivides the window for sub-second resolution (default 10)
 
 metrics:
   enabled: true

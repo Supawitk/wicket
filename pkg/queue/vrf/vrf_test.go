@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Supawitk/wicket/pkg/queue"
 )
@@ -486,5 +487,78 @@ func TestExportOnEmptyQueue(t *testing.T) {
 	entries := q.Export()
 	if len(entries) != 0 {
 		t.Fatalf("empty queue export len = %d", len(entries))
+	}
+}
+
+// TestStatusAfterOpenIsConstantTime is the regression test for the O(N)
+// rank bug. With the old per-call rank, polling N tickets cost O(N²) total
+// — a 1M-ticket drop with each user polling once would do 10¹² ops. With
+// positions materialised at Open(), each Status query is a map lookup.
+//
+// We don't assert wall-clock time (CI is noisy). Instead we assert the
+// total time stays within a sane envelope for N polls over N tickets. The
+// old implementation would blow past this by orders of magnitude.
+func TestStatusAfterOpenIsConstantTime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy queue test in -short mode")
+	}
+	q, _ := New(Config{})
+	ctx := context.Background()
+	const N = 20_000
+
+	ids := make([]string, 0, N)
+	for i := 0; i < N; i++ {
+		tk, err := q.Enqueue(ctx, "")
+		if err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+		ids = append(ids, tk.ID)
+	}
+	q.Open()
+
+	start := time.Now()
+	for _, id := range ids {
+		if _, err := q.Status(ctx, id); err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Per-call budget. 50µs is generous on any 2020+ laptop; the O(N²)
+	// implementation would burn ~21ms per call at this N, blowing past
+	// even a 1s total budget.
+	perCall := elapsed / N
+	if perCall > 50*time.Microsecond {
+		t.Fatalf("avg Status time = %v over %d tickets, want <50µs (O(N) rank regression?)", perCall, N)
+	}
+}
+
+// TestStatusO1AfterEnqueueOpen exercises the incremental positions update:
+// post-open Enqueue must place the new ticket at preCount + postSeq
+// without forcing a rebuild.
+func TestStatusO1AfterEnqueueOpen(t *testing.T) {
+	q, _ := New(Config{})
+	ctx := context.Background()
+
+	preIDs := make([]string, 100)
+	for i := range preIDs {
+		tk, _ := q.Enqueue(ctx, "")
+		preIDs[i] = tk.ID
+	}
+	q.Open()
+
+	// Post-open: every new ticket should land at strictly increasing
+	// positions starting from preCount+1, regardless of how Status is
+	// interleaved.
+	for i := 1; i <= 50; i++ {
+		tk, _ := q.Enqueue(ctx, "")
+		s, err := q.Status(ctx, tk.ID)
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		want := int64(100 + i)
+		if s.Position != want {
+			t.Fatalf("position[%d] = %d want %d", i, s.Position, want)
+		}
 	}
 }

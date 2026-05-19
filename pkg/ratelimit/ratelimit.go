@@ -16,20 +16,37 @@ type bucket struct {
 	updatedAt time.Time
 }
 
-// Config configures a Limiter. Rate is tokens-per-second sustained;
-// Burst is the maximum tokens accumulated.
+// Config configures a Limiter.
+//
+//   - Rate is sustained tokens-per-second.
+//   - Burst is the maximum tokens that can accumulate.
+//   - IdleTTL evicts buckets whose last update is older than IdleTTL.
+//     Zero (the default for the Config zero value) is treated as
+//     defaultIdleTTL; pass a negative value to disable eviction.
+//   - SweepInterval is the minimum time between eviction sweeps.
+//     Defaults to IdleTTL/10 (capped at 1 minute).
 type Config struct {
-	Rate  float64
-	Burst float64
-	Now   func() time.Time
+	Rate          float64
+	Burst         float64
+	IdleTTL       time.Duration
+	SweepInterval time.Duration
+	Now           func() time.Time
 }
 
+const (
+	defaultIdleTTL       = 10 * time.Minute
+	defaultSweepInterval = time.Minute
+)
+
 type TokenBucket struct {
-	mu      sync.Mutex
-	rate    float64
-	burst   float64
-	now     func() time.Time
-	buckets map[string]*bucket
+	mu            sync.Mutex
+	rate          float64
+	burst         float64
+	now           func() time.Time
+	buckets       map[string]*bucket
+	idleTTL       time.Duration
+	sweepInterval time.Duration
+	lastSweep     time.Time
 }
 
 func New(cfg Config) *TokenBucket {
@@ -45,11 +62,28 @@ func New(cfg Config) *TokenBucket {
 	if now == nil {
 		now = time.Now
 	}
+	idleTTL := cfg.IdleTTL
+	if idleTTL == 0 {
+		idleTTL = defaultIdleTTL
+	}
+	sweepInterval := cfg.SweepInterval
+	if sweepInterval <= 0 {
+		sweepInterval = idleTTL / 10
+		if sweepInterval > defaultSweepInterval {
+			sweepInterval = defaultSweepInterval
+		}
+		if sweepInterval <= 0 {
+			sweepInterval = defaultSweepInterval
+		}
+	}
 	return &TokenBucket{
-		rate:    rate,
-		burst:   burst,
-		now:     now,
-		buckets: make(map[string]*bucket),
+		rate:          rate,
+		burst:         burst,
+		now:           now,
+		buckets:       make(map[string]*bucket),
+		idleTTL:       idleTTL,
+		sweepInterval: sweepInterval,
+		lastSweep:     now(),
 	}
 }
 
@@ -57,6 +91,7 @@ func (t *TokenBucket) Allow(key string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
+	t.maybeSweepLocked(now)
 	b, ok := t.buckets[key]
 	if !ok {
 		b = &bucket{tokens: t.burst, updatedAt: now}
@@ -75,6 +110,25 @@ func (t *TokenBucket) Allow(key string) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// maybeSweepLocked evicts buckets idle longer than IdleTTL, but only when
+// at least SweepInterval has elapsed since the previous sweep. Amortizes
+// O(N) cleanup across many Allow calls so the steady-state cost stays low.
+func (t *TokenBucket) maybeSweepLocked(now time.Time) {
+	if t.idleTTL < 0 {
+		return
+	}
+	if now.Sub(t.lastSweep) < t.sweepInterval {
+		return
+	}
+	cutoff := now.Add(-t.idleTTL)
+	for k, b := range t.buckets {
+		if b.updatedAt.Before(cutoff) {
+			delete(t.buckets, k)
+		}
+	}
+	t.lastSweep = now
 }
 
 // Size reports the number of distinct keys tracked. Useful for tests and

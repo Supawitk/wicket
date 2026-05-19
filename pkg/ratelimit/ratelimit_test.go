@@ -82,6 +82,83 @@ func TestSize(t *testing.T) {
 	}
 }
 
+// TestEvictsIdleBuckets is the regression test for the unbounded-map
+// memory leak: without eviction, a service hit by rotating IPv6 / spoofed
+// IPs accumulates buckets forever and OOMs. After IdleTTL elapses, idle
+// buckets must be removed; active ones must be preserved.
+func TestEvictsIdleBuckets(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := New(Config{
+		Rate:          1,
+		Burst:         1,
+		IdleTTL:       time.Minute,
+		SweepInterval: 30 * time.Second,
+		Now:           func() time.Time { return now },
+	})
+
+	// 1000 distinct keys touched once.
+	for i := 0; i < 1000; i++ {
+		l.Allow(fmt.Sprintf("k-%d", i))
+	}
+	if got := l.Size(); got != 1000 {
+		t.Fatalf("after 1000 keys Size=%d want 1000", got)
+	}
+
+	// Advance past IdleTTL, then trigger a sweep with one more call.
+	now = now.Add(2 * time.Minute)
+	l.Allow("trigger")
+
+	if got := l.Size(); got != 1 {
+		t.Fatalf("after eviction Size=%d want 1 (only the trigger key)", got)
+	}
+}
+
+// TestEvictionPreservesActiveKeys ensures the sweep is selective: keys
+// that were touched recently must survive even when stale neighbours get
+// evicted.
+func TestEvictionPreservesActiveKeys(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := New(Config{
+		Rate:          1,
+		Burst:         1,
+		IdleTTL:       time.Minute,
+		SweepInterval: 30 * time.Second,
+		Now:           func() time.Time { return now },
+	})
+
+	l.Allow("stale-a")
+	l.Allow("stale-b")
+	now = now.Add(30 * time.Second)
+	l.Allow("fresh-a") // halfway through IdleTTL
+	now = now.Add(31 * time.Second)
+	// stale-* are now older than IdleTTL; fresh-a is not. Sweep fires.
+	l.Allow("fresh-b")
+
+	if got := l.Size(); got != 2 {
+		t.Fatalf("Size=%d want 2 (fresh-a, fresh-b)", got)
+	}
+}
+
+// TestEvictionDisabled confirms IdleTTL<0 turns the sweep off entirely so
+// callers with a bounded key set keep the previous (leak-but-fast) shape.
+func TestEvictionDisabled(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := New(Config{
+		Rate:    1,
+		Burst:   1,
+		IdleTTL: -1,
+		Now:     func() time.Time { return now },
+	})
+	for i := 0; i < 100; i++ {
+		l.Allow(fmt.Sprintf("k-%d", i))
+	}
+	now = now.Add(24 * time.Hour)
+	l.Allow("trigger")
+	if got := l.Size(); got != 101 {
+		t.Fatalf("Size=%d want 101 (eviction disabled)", got)
+	}
+}
+
 // TestConcurrentAllowSameKey hammers Allow on one key from many goroutines.
 // With -race this catches any unsynchronised access to the shared bucket.
 // The total allowed must equal the burst exactly: no double-grants, no

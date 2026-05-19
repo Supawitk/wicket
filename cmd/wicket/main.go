@@ -42,6 +42,7 @@ import (
 	"github.com/Supawitk/wicket/pkg/queue"
 	"github.com/Supawitk/wicket/pkg/queue/fifo"
 	"github.com/Supawitk/wicket/pkg/queue/vrf"
+	"github.com/Supawitk/wicket/pkg/ratelimit"
 	"github.com/Supawitk/wicket/pkg/store/memory"
 )
 
@@ -63,15 +64,19 @@ type config struct {
 	} `yaml:"queue"`
 
 	RateLimit struct {
-		RPS   float64 `yaml:"rps"`
-		Burst float64 `yaml:"burst"`
+		RPS           float64       `yaml:"rps"`
+		Burst         float64       `yaml:"burst"`
+		IdleTTL       time.Duration `yaml:"idle_ttl"`
+		SweepInterval time.Duration `yaml:"sweep_interval"`
 	} `yaml:"rate_limit"`
 
 	CircuitBreaker struct {
-		FailureRatio float64       `yaml:"failure_ratio"`
-		MinSamples   int64         `yaml:"min_samples"`
-		Cooldown     time.Duration `yaml:"cooldown"`
-		HalfOpenMax  int64         `yaml:"half_open_max"`
+		FailureRatio  float64       `yaml:"failure_ratio"`
+		MinSamples    int64         `yaml:"min_samples"`
+		Cooldown      time.Duration `yaml:"cooldown"`
+		HalfOpenMax   int64         `yaml:"half_open_max"`
+		Window        time.Duration `yaml:"window"`
+		WindowBuckets int           `yaml:"window_buckets"`
 	} `yaml:"circuit_breaker"`
 
 	Metrics struct {
@@ -297,7 +302,16 @@ func newTracerProvider(endpoint, service string) (*sdktrace.TracerProvider, erro
 func buildHandler(cfg *config, static *staticParts) (http.Handler, error) {
 	opts := []wicket.Option{}
 	if cfg.RateLimit.RPS > 0 {
-		opts = append(opts, wicket.WithRateLimit(cfg.RateLimit.RPS, time.Second))
+		lcfg := ratelimit.Config{
+			Rate:          cfg.RateLimit.RPS,
+			Burst:         cfg.RateLimit.Burst,
+			IdleTTL:       cfg.RateLimit.IdleTTL,
+			SweepInterval: cfg.RateLimit.SweepInterval,
+		}
+		if lcfg.Burst <= 0 {
+			lcfg.Burst = lcfg.Rate
+		}
+		opts = append(opts, wicket.WithLimiter(ratelimit.New(lcfg)))
 	}
 	if cfg.CircuitBreaker.FailureRatio > 0 || cfg.CircuitBreaker.MinSamples > 0 {
 		bcfg := circuit.DefaultConfig()
@@ -312,6 +326,12 @@ func buildHandler(cfg *config, static *staticParts) (http.Handler, error) {
 		}
 		if cfg.CircuitBreaker.HalfOpenMax > 0 {
 			bcfg.HalfOpenMax = cfg.CircuitBreaker.HalfOpenMax
+		}
+		if cfg.CircuitBreaker.Window > 0 {
+			bcfg.Window = cfg.CircuitBreaker.Window
+		}
+		if cfg.CircuitBreaker.WindowBuckets > 0 {
+			bcfg.WindowBuckets = cfg.CircuitBreaker.WindowBuckets
 		}
 		opts = append(opts, wicket.WithCircuitBreaker(circuit.New(bcfg)))
 	}

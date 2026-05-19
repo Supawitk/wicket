@@ -1,10 +1,15 @@
-// Package circuit implements a simple three-state circuit breaker
-// (Closed → Open → Half-Open) suitable for wrapping calls to a flaky
-// backend.
+// Package circuit implements a three-state circuit breaker
+// (Closed → Open → Half-Open) with a rolling time-window failure ratio.
 //
 // A breaker that has tripped rejects calls until a Cooldown elapses, then
 // admits a bounded number of probe calls. Success during the probe phase
 // returns the breaker to Closed; any failure trips it back to Open.
+//
+// The failure ratio is computed over the most recent Window of activity,
+// not over the breaker's entire lifetime. Without this, a long-running
+// service can accumulate so many successes that a sudden 100% failure
+// spike never crosses the ratio threshold. Hystrix, sony-gobreaker, and
+// resilience4j all use rolling windows for the same reason.
 package circuit
 
 import (
@@ -41,27 +46,54 @@ type Config struct {
 	MinSamples   int64
 	Cooldown     time.Duration
 	HalfOpenMax  int64
-	Now          func() time.Time
+
+	// Window is the rolling time window over which success/failure
+	// counts are tracked. Older samples decay out. Defaults to 10s.
+	Window time.Duration
+	// WindowBuckets is the number of buckets the window is divided
+	// into. More buckets smooth out boundary effects at the cost of
+	// memory. Defaults to 10.
+	WindowBuckets int
+
+	Now func() time.Time
 }
 
 func DefaultConfig() Config {
 	return Config{
-		FailureRatio: 0.5,
-		MinSamples:   20,
-		Cooldown:     30 * time.Second,
-		HalfOpenMax:  3,
-		Now:          time.Now,
+		FailureRatio:  0.5,
+		MinSamples:    20,
+		Cooldown:      30 * time.Second,
+		HalfOpenMax:   3,
+		Window:        10 * time.Second,
+		WindowBuckets: 10,
+		Now:           time.Now,
 	}
 }
 
-type Breaker struct {
-	cfg     Config
-	mu      sync.Mutex
-	state   State
+type bucket struct {
 	success int64
 	failure int64
-	openAt  time.Time
-	probe   int64
+}
+
+type Breaker struct {
+	cfg Config
+	mu  sync.Mutex
+
+	state State
+
+	// Rolling-window state, used only in StateClosed to compute the
+	// failure ratio. Each bucket holds counts for one slice of the
+	// window; the ring is rotated as time advances.
+	buckets      []bucket
+	bucketDur    time.Duration
+	currentIdx   int
+	currentStart time.Time
+
+	// Half-open probe accounting. Kept separate from the window so
+	// expiring buckets cannot reset probe progress.
+	halfOpenSucc int64
+	probe        int64
+	openAt       time.Time
 }
 
 func New(cfg Config) *Breaker {
@@ -77,10 +109,21 @@ func New(cfg Config) *Breaker {
 	if cfg.HalfOpenMax <= 0 {
 		cfg.HalfOpenMax = 3
 	}
+	if cfg.Window <= 0 {
+		cfg.Window = 10 * time.Second
+	}
+	if cfg.WindowBuckets <= 0 {
+		cfg.WindowBuckets = 10
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Breaker{cfg: cfg}
+	return &Breaker{
+		cfg:          cfg,
+		buckets:      make([]bucket, cfg.WindowBuckets),
+		bucketDur:    cfg.Window / time.Duration(cfg.WindowBuckets),
+		currentStart: cfg.Now(),
+	}
 }
 
 // Allow returns nil if the call may proceed. After the call completes the
@@ -113,10 +156,11 @@ func (b *Breaker) RecordSuccess() {
 	defer b.mu.Unlock()
 	switch b.state {
 	case StateClosed:
-		b.success++
+		b.advanceLocked(b.cfg.Now())
+		b.buckets[b.currentIdx].success++
 	case StateHalfOpen:
-		b.success++
-		if b.success >= b.cfg.HalfOpenMax {
+		b.halfOpenSucc++
+		if b.halfOpenSucc >= b.cfg.HalfOpenMax {
 			b.transitionLocked(StateClosed)
 		}
 	}
@@ -127,13 +171,12 @@ func (b *Breaker) RecordFailure() {
 	defer b.mu.Unlock()
 	switch b.state {
 	case StateClosed:
-		b.failure++
-		total := b.success + b.failure
-		if total >= b.cfg.MinSamples {
-			ratio := float64(b.failure) / float64(total)
-			if ratio >= b.cfg.FailureRatio {
-				b.transitionLocked(StateOpen)
-			}
+		now := b.cfg.Now()
+		b.advanceLocked(now)
+		b.buckets[b.currentIdx].failure++
+		failure, total := b.sumLocked()
+		if total >= b.cfg.MinSamples && float64(failure)/float64(total) >= b.cfg.FailureRatio {
+			b.transitionLocked(StateOpen)
 		}
 	case StateHalfOpen:
 		b.transitionLocked(StateOpen)
@@ -146,10 +189,50 @@ func (b *Breaker) State() State {
 	return b.state
 }
 
+// advanceLocked rolls the ring forward so that buckets[currentIdx]
+// represents the bucket containing now, zeroing any buckets we cross.
+func (b *Breaker) advanceLocked(now time.Time) {
+	elapsed := now.Sub(b.currentStart)
+	if elapsed < b.bucketDur {
+		return
+	}
+	steps := int(elapsed / b.bucketDur)
+	if steps >= len(b.buckets) {
+		// Entire window has elapsed since our last write; everything
+		// stale, clear and restart at the current bucket boundary.
+		for i := range b.buckets {
+			b.buckets[i] = bucket{}
+		}
+		b.currentIdx = 0
+		// Align currentStart to a bucket boundary anchored on now to
+		// avoid drifting past the window length.
+		b.currentStart = now
+		return
+	}
+	for i := 0; i < steps; i++ {
+		b.currentIdx = (b.currentIdx + 1) % len(b.buckets)
+		b.buckets[b.currentIdx] = bucket{}
+	}
+	b.currentStart = b.currentStart.Add(time.Duration(steps) * b.bucketDur)
+}
+
+func (b *Breaker) sumLocked() (failure, total int64) {
+	var success int64
+	for _, bk := range b.buckets {
+		success += bk.success
+		failure += bk.failure
+	}
+	return failure, success + failure
+}
+
 func (b *Breaker) transitionLocked(next State) {
 	b.state = next
-	b.success = 0
-	b.failure = 0
+	for i := range b.buckets {
+		b.buckets[i] = bucket{}
+	}
+	b.currentIdx = 0
+	b.currentStart = b.cfg.Now()
+	b.halfOpenSucc = 0
 	b.probe = 0
 	if next == StateOpen {
 		b.openAt = b.cfg.Now()
