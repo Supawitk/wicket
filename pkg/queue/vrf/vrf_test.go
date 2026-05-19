@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -530,6 +532,66 @@ func TestStatusAfterOpenIsConstantTime(t *testing.T) {
 	perCall := elapsed / N
 	if perCall > 50*time.Microsecond {
 		t.Fatalf("avg Status time = %v over %d tickets, want <50µs (O(N) rank regression?)", perCall, N)
+	}
+}
+
+// TestConcurrentStatusUsesRLock is the regression test for the global
+// write-lock on Status: with the positions map already materialised,
+// many goroutines calling Status concurrently must all observe correct
+// results without serialising. The -race detector catches any unsafe
+// access to the shared map; correctness of the returned positions
+// confirms the RLock fast path returns the same answer as the locked
+// rebuild.
+func TestConcurrentStatusUsesRLock(t *testing.T) {
+	q, _ := New(Config{})
+	ctx := context.Background()
+
+	const N = 500
+	ids := make([]string, 0, N)
+	want := make(map[string]int64, N)
+	for i := 0; i < N; i++ {
+		tk, err := q.Enqueue(ctx, "")
+		if err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+		ids = append(ids, tk.ID)
+	}
+	q.Open()
+	// Snapshot the expected positions from a serial pass.
+	for _, id := range ids {
+		s, err := q.Status(ctx, id)
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		want[id] = s.Position
+	}
+
+	const goroutines = 32
+	const perGoroutine = 200
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	errCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				id := ids[i%len(ids)]
+				s, err := q.Status(ctx, id)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if s.Position != want[id] {
+					errCh <- fmt.Errorf("position drift for %s: got %d want %d", id, s.Position, want[id])
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
 	}
 }
 

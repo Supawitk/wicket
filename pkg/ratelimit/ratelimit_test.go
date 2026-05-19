@@ -172,6 +172,53 @@ func TestMillionUniqueKeysEvict(t *testing.T) {
 	}
 }
 
+// TestMaxSweepBatchCapsWork is the regression test for the unbounded
+// lock-hold during a sweep: with MaxSweepBatch set, a single sweep must
+// visit at most that many entries so the lock-hold time on one Allow
+// stays predictable. Subsequent sweeps eventually drain the rest.
+func TestMaxSweepBatchCapsWork(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := New(Config{
+		Rate:          1,
+		Burst:         1,
+		IdleTTL:       time.Minute,
+		SweepInterval: 30 * time.Second,
+		MaxSweepBatch: 100,
+		Now:           func() time.Time { return now },
+	})
+
+	const N = 1000
+	for i := 0; i < N; i++ {
+		l.Allow(fmt.Sprintf("k-%d", i))
+	}
+	if got := l.Size(); got != N {
+		t.Fatalf("Size=%d want %d", got, N)
+	}
+
+	// Advance past IdleTTL so every key is sweepable, then trigger one sweep.
+	now = now.Add(2 * time.Minute)
+	l.Allow("trigger")
+	// After one bounded sweep, the size must have dropped — but by at
+	// most MaxSweepBatch from the stale set. The trigger key counts as
+	// one of the surviving entries.
+	after := l.Size()
+	if after >= N+1 {
+		t.Fatalf("no eviction happened, Size=%d", after)
+	}
+	if N+1-after > 100 {
+		t.Fatalf("evicted more than MaxSweepBatch: removed %d in one sweep", N+1-after)
+	}
+
+	// Keep sweeping until everything drains. Need at most ~N/100 cycles.
+	for i := 0; i < 50 && l.Size() > 1; i++ {
+		now = now.Add(31 * time.Second)
+		l.Allow("trigger")
+	}
+	if got := l.Size(); got != 1 {
+		t.Fatalf("after repeated sweeps Size=%d want 1", got)
+	}
+}
+
 // TestEvictionDisabled confirms IdleTTL<0 turns the sweep off entirely so
 // callers with a bounded key set keep the previous (leak-but-fast) shape.
 func TestEvictionDisabled(t *testing.T) {

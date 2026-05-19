@@ -21,10 +21,11 @@ func (e entry) expired(now time.Time) bool {
 }
 
 type Store struct {
-	mu     sync.Mutex
-	data   map[string]entry
-	now    func() time.Time
-	stopCh chan struct{}
+	mu       sync.Mutex
+	data     map[string]entry
+	now      func() time.Time
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 type Option func(*Store)
@@ -124,8 +125,12 @@ func (s *Store) Incr(_ context.Context, key string, ttl time.Duration) (int64, e
 	return n, nil
 }
 
+// Close stops the janitor goroutine. Safe to call multiple times — a
+// second close on stopCh would otherwise panic, which mattered for code
+// paths (HTTP handlers, deferred test cleanups) that can fire Close more
+// than once.
 func (s *Store) Close() error {
-	close(s.stopCh)
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	return nil
 }
 

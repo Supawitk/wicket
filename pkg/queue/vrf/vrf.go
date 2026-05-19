@@ -21,6 +21,13 @@
 // All modes also expose an Audit() method returning a Merkle log of all
 // (ticketID, score) pairs so an operator can publish a compact, tamper-
 // evident summary after the event.
+//
+// Process-local state: this implementation keeps the ticket set and
+// positions map in process memory. Running multiple sidecar instances
+// in front of a shared upstream therefore requires sticky load balancing
+// — Enqueue on replica A and Status on replica B will report "unknown
+// ticket" on B. A shared-store variant is a known follow-up; the
+// challenger pkg/store interface is the model.
 package vrf
 
 import (
@@ -317,6 +324,26 @@ func (q *Queue) Enqueue(_ context.Context, _ string) (*queue.Ticket, error) {
 }
 
 func (q *Queue) Status(_ context.Context, ticketID string) (*queue.Status, error) {
+	// Fast path: positions is already materialised. Concurrent Status
+	// queries serialised on a write lock turn a polling storm
+	// (1M users × /status every 5s) into a queue of its own. RLock lets
+	// them run in parallel; we only escalate to a write lock if the
+	// positions map needs a rebuild.
+	q.mu.RLock()
+	if _, ok := q.tickets[ticketID]; !ok {
+		q.mu.RUnlock()
+		return nil, queue.ErrUnknownTicket
+	}
+	if q.positions != nil {
+		st := q.buildStatusLocked(ticketID)
+		q.mu.RUnlock()
+		return st, nil
+	}
+	q.mu.RUnlock()
+
+	// Slow path: rebuild under the write lock, then read. Re-check
+	// everything because a concurrent Enqueue / rebuild may have moved
+	// state while we were unlocked.
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if _, ok := q.tickets[ticketID]; !ok {
@@ -325,6 +352,13 @@ func (q *Queue) Status(_ context.Context, ticketID string) (*queue.Status, error
 	if q.positions == nil {
 		q.rebuildPositionsLocked()
 	}
+	return q.buildStatusLocked(ticketID), nil
+}
+
+// buildStatusLocked composes a Status from the current positions map and
+// cursor. Caller must hold either q.mu (Lock or RLock); the function
+// performs only reads.
+func (q *Queue) buildStatusLocked(ticketID string) *queue.Status {
 	position := q.positions[ticketID]
 	ahead := position - q.cursor - 1
 	if ahead < 0 {
@@ -336,7 +370,7 @@ func (q *Queue) Status(_ context.Context, ticketID string) (*queue.Status, error
 		Cursor:   q.cursor,
 		Ahead:    ahead,
 		Admitted: position <= q.cursor,
-	}, nil
+	}
 }
 
 func (q *Queue) Advance(_ context.Context, n int64) error {

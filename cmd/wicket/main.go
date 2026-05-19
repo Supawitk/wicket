@@ -6,6 +6,14 @@
 // (rate_limit, circuit_breaker) are rebuilt atomically; other sections
 // (listen, upstream, store, queue, pow, identity) require a restart and
 // are logged as a warning if changed.
+//
+// Horizontal scaling caveat: with store.backend=redis the PoW challenger
+// state is shared across replicas, so issue-on-A / verify-on-B works
+// uniformly. The queue (fifo, vrf, ecvrf) still holds its tickets in
+// per-process memory — running multiple sidecar replicas in front of a
+// shared upstream therefore requires sticky sessions on the load
+// balancer so /enqueue and /status land on the same replica. A shared
+// store backend for the queue is a known follow-up.
 package main
 
 import (

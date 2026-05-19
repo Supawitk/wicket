@@ -162,6 +162,21 @@ func TestConcurrentIncr(t *testing.T) {
 	}
 }
 
+// TestCloseIdempotent is the regression test for the double-close panic.
+// Deferred cleanups in test code and shutdown paths in handlers can both
+// fire Close on the same store; the second close(stopCh) used to panic
+// with "close of closed channel".
+func TestCloseIdempotent(t *testing.T) {
+	s := New()
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	// A second Close must not panic.
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
 func TestGetReturnsCopy(t *testing.T) {
 	s := New()
 	t.Cleanup(func() { _ = s.Close() })

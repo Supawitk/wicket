@@ -3,6 +3,11 @@
 // Each Enqueue allocates the next monotonic position. Advance bumps the
 // admission cursor by n; a ticket is admitted once its position is at or
 // before the cursor.
+//
+// Process-local state: tickets live in a map on the *Queue struct.
+// Multi-replica sidecar deployments therefore require sticky load
+// balancing so Enqueue and Status for the same client land on the same
+// replica.
 package fifo
 
 import (

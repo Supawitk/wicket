@@ -30,6 +30,14 @@ type Config struct {
 	Burst         float64
 	IdleTTL       time.Duration
 	SweepInterval time.Duration
+	// MaxSweepBatch caps the number of map entries a single sweep may
+	// visit while holding the limiter's lock. Zero (the default) leaves
+	// the sweep unbounded — every Allow that crosses SweepInterval
+	// scans the whole map. Set it (e.g. 10_000) under strict p99
+	// budgets at multi-million-key fan-out, so one unlucky Allow can
+	// never stall behind a 1M-entry sweep. Stale buckets just take a
+	// few more sweep cycles to fully drain.
+	MaxSweepBatch int
 	Now           func() time.Time
 }
 
@@ -47,6 +55,7 @@ type TokenBucket struct {
 	idleTTL       time.Duration
 	sweepInterval time.Duration
 	lastSweep     time.Time
+	maxSweepBatch int
 }
 
 func New(cfg Config) *TokenBucket {
@@ -84,6 +93,7 @@ func New(cfg Config) *TokenBucket {
 		idleTTL:       idleTTL,
 		sweepInterval: sweepInterval,
 		lastSweep:     now(),
+		maxSweepBatch: cfg.MaxSweepBatch,
 	}
 }
 
@@ -114,7 +124,10 @@ func (t *TokenBucket) Allow(key string) bool {
 
 // maybeSweepLocked evicts buckets idle longer than IdleTTL, but only when
 // at least SweepInterval has elapsed since the previous sweep. Amortizes
-// O(N) cleanup across many Allow calls so the steady-state cost stays low.
+// O(N) cleanup across many Allow calls so the steady-state cost stays
+// low. When MaxSweepBatch > 0 the visit count is capped per call so the
+// lock-hold time on a single Allow stays predictable even when the
+// keyspace is in the millions.
 func (t *TokenBucket) maybeSweepLocked(now time.Time) {
 	if t.idleTTL < 0 {
 		return
@@ -123,7 +136,12 @@ func (t *TokenBucket) maybeSweepLocked(now time.Time) {
 		return
 	}
 	cutoff := now.Add(-t.idleTTL)
+	visited := 0
 	for k, b := range t.buckets {
+		if t.maxSweepBatch > 0 && visited >= t.maxSweepBatch {
+			break
+		}
+		visited++
 		if b.updatedAt.Before(cutoff) {
 			delete(t.buckets, k)
 		}
